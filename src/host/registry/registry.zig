@@ -242,6 +242,9 @@ pub const LoadedModel = struct {
     /// An engine beside MLX serving this model (ds4 or llama.cpp for a GGUF, the Neural Engine for an MLX pack;
     /// `host/engines/`): the MLX fields stay null. A GGUF's tokenizer and template are the engine's.
     engine: ?*Served = null,
+    /// This entry's GGUF routes to the embedded ds4 engine (set when its load claims the slot; the route is a
+    /// property of the file, so it stays set). ds4 is one engine per process: see `ds4EngineVictimLocked`.
+    ds4_route: bool = false,
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
@@ -1068,6 +1071,26 @@ pub const ModelRegistry = struct {
             if (entry.state != .ready or entry.refcount.load(.acquire) != 0) {
                 log.err("{s}: refused: {s} is busy, and both stream packs read the one process foreign-bytes value\n", .{ exclude_id, entry.id });
                 return error.ForeignBytesReaderBusy;
+            }
+            return entry;
+        }
+        return null;
+    }
+
+    /// ds4 runs one engine per process: it holds a process-wide instance lock and model-family globals, and a
+    /// second open exit()s the process. So before a load that opens ds4 (`incoming_ds4`), another ds4 entry is
+    /// the forced eviction victim when idle; one in use, loading or evicting refuses the load with
+    /// `error.Ds4EngineBusy` instead.
+    pub fn ds4EngineVictimLocked(self: *ModelRegistry, exclude_id: []const u8, incoming_ds4: bool) error{Ds4EngineBusy}!?*LoadedModel {
+        if (!incoming_ds4) return null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (std.mem.eql(u8, entry.id, exclude_id) or !entry.ds4_route) continue;
+            if (entry.state != .ready and entry.state != .loading and entry.state != .evicting) continue;
+            if (entry.state != .ready or entry.refcount.load(.acquire) != 0) {
+                log.err("{s}: refused: {s} holds the process ds4 engine and is busy\n", .{ exclude_id, entry.id });
+                return error.Ds4EngineBusy;
             }
             return entry;
         }
@@ -2495,6 +2518,34 @@ test "ModelRegistry: registerByPath registers under the caller's org/name id" {
     try testing.expect(reg.peek("org/name") != null);
     try testing.expectEqualStrings(id, try reg.registerByPath(io, path, "org/name"));
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
+}
+
+test "ModelRegistry: a second ds4 GGUF unloads an idle ds4 model and is refused by a busy one" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const glm = try makeReadyStub(reg, "glm-gguf", 180_000_000_000);
+    glm.ds4_route = true;
+    const mlx = try makeReadyStub(reg, "qwen-mlx", 20_000_000_000);
+    const deepseek = try beginLoad(reg, "deepseek-gguf", 100);
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    // A load that does not open ds4 is unaffected; a reload of the same id is not a second engine.
+    try testing.expect(try reg.ds4EngineVictimLocked("qwen-mlx", false) == null);
+    try testing.expect(try reg.ds4EngineVictimLocked("glm-gguf", true) == null);
+    _ = mlx;
+    // Busy: refused, nothing marked.
+    _ = glm.refcount.fetchAdd(1, .acq_rel);
+    try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked("deepseek-gguf", true));
+    glm.refcount.store(0, .release);
+    // Idle: the plan evicts it although both caps hold.
+    const victim = (try reg.ds4EngineVictimLocked("deepseek-gguf", true)).?;
+    try testing.expectEqualStrings("glm-gguf", victim.id);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(deepseek.id, victim, &buf, 0));
+    try testing.expectEqual(LoadState.evicting, glm.state);
+    reg.unmarkEvictingLocked(glm);
+    reg.markUnloadedLocked(deepseek);
 }
 
 test "ModelRegistry: a second stream pack that reads the foreign bytes unloads an idle one and is refused by a busy one" {
