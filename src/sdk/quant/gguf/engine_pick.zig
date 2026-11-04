@@ -64,6 +64,17 @@ pub const Info = struct {
 // qwen4exp file ds4 cannot load goes there instead.
 const ds4_only_archs = [_][]const u8{ "deepseek41", "qwen4exp", "glm-dsa", "glm5-next" };
 
+// Archs ds4 loads as its GLM-DSA family (GLM-5.2/5.3 and GLM-5.3-Flash). That family picks
+// its own prefill chunks: ds4 refuses to open one with an explicit prefill_chunk.
+const ds4_glm_archs = [_][]const u8{ "glm-dsa", "glm5-next" };
+
+/// True when ds4 serves this GGUF as its GLM-DSA family (see `ds4_glm_archs`).
+pub fn isDs4GlmFamily(info: Info) bool {
+    const a = info.architecture orelse return false;
+    for (ds4_glm_archs) |g| if (std.mem.eql(u8, a, g)) return true;
+    return false;
+}
+
 // Archs whose NextN layers ds4 drafts from inside the checkpoint; DeepSeek-V4 declares
 // `nextn_predict_layers` but takes its head from a separate GGUF, and ds4 refuses to open it with one armed.
 const ds4_embedded_mtp_archs = [_][]const u8{ "glm-dsa", "glm5-next", "qwen4exp" };
@@ -626,4 +637,12 @@ test "declaresPooling: an embedding GGUF names a pooling type, a chat GGUF does 
         var r: std.Io.Reader = .fixed(bytes);
         try testing.expectEqual(c.want, try declaresPooling(&r));
     }
+}
+
+test "isDs4GlmFamily: the GLM-DSA archs ds4 sizes its own prefill for, nothing else" {
+    try std.testing.expect(isDs4GlmFamily(.{ .architecture = @constCast("glm-dsa") }));
+    try std.testing.expect(isDs4GlmFamily(.{ .architecture = @constCast("glm5-next") }));
+    try std.testing.expect(!isDs4GlmFamily(.{ .architecture = @constCast("deepseek41") }));
+    try std.testing.expect(!isDs4GlmFamily(.{ .architecture = @constCast("qwen4exp") }));
+    try std.testing.expect(!isDs4GlmFamily(.{}));
 }

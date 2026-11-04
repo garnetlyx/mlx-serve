@@ -345,6 +345,9 @@ const FakeBridge = struct {
     pub fn ggufSpec(_: std.Io, _: std.mem.Allocator, _: []const u8) engine_pick.Spec {
         return .{ .embedded_mtp = true };
     }
+    pub fn ggufIsGlmFamily(_: std.Io, _: std.mem.Allocator, _: []const u8) bool {
+        return false;
+    }
     pub const Ds4Engine = struct {
         pub const ChatTurn = struct { role: []const u8, content: []const u8 };
         embedded_mtp: bool,

@@ -25,10 +25,14 @@ pub fn open(comptime bridge: type, io: std.Io, gpa: std.mem.Allocator, path: []c
     defer if (found) |p| gpa.free(p);
     if (found) |p| if (spec.support_gguf) log.info("[ds4] MTP draft head: {s}\n", .{p}) else log.info("[ds4] this model takes no support GGUF in ds4, skipping {s} (--mlx-gguf drafts with it)\n", .{p});
     const mtp_path = if (spec.support_gguf) found else null;
+    // ds4 refuses to open its GLM-DSA family with an explicit prefill chunk (that family sizes its own), so the
+    // server-wide `--prefill-chunk`, which other models need, stays off for it.
+    const glm = flags.prefill_chunk != 0 and bridge.ggufIsGlmFamily(io, gpa, path);
+    if (glm) log.info("[ds4] GLM picks its own prefill chunks; --prefill-chunk {d} not applied\n", .{flags.prefill_chunk});
     const engine = try bridge.Ds4Engine.open(gpa, path, .{
         .warm_weights = true,
         .ssd_streaming = flags.ssd_streaming,
-        .prefill_chunk = flags.prefill_chunk,
+        .prefill_chunk = if (glm) 0 else flags.prefill_chunk,
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) round.mtp_draft_tokens else 0,
         .mtp_margin = round.mtp_margin,
@@ -53,6 +57,9 @@ test "open: a support GGUF beside the model reaches ds4 only for an arch that ta
         const B = struct {
             pub fn ggufSpec(_: std.Io, _: std.mem.Allocator, _: []const u8) engine_pick.Spec {
                 return .{ .support_gguf = takes };
+            }
+            pub fn ggufIsGlmFamily(_: std.Io, _: std.mem.Allocator, _: []const u8) bool {
+                return false;
             }
             pub const Ds4Engine = struct {
                 pub fn open(_: std.mem.Allocator, _: []const u8, opts: anytype) !*Ds4Engine {

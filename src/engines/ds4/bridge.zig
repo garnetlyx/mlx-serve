@@ -252,6 +252,13 @@ pub fn ggufSpec(io: std.Io, allocator: std.mem.Allocator, path: []const u8) gguf
     return gguf_meta.ds4Spec(info);
 }
 
+/// True when ds4 serves the GGUF at `path` as its GLM-DSA family, which rejects an explicit prefill chunk.
+pub fn ggufIsGlmFamily(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
+    var info = gguf_meta.readFromFile(io, allocator, path) catch return false;
+    defer info.deinit(allocator);
+    return gguf_meta.isDs4GlmFamily(info);
+}
+
 /// ds4 reads ONE file and exit()s the process on a missing tensor, so a split
 /// GGUF (its shard 1 may hold no tensors at all) is refused here by name (#586).
 fn refuseSplitGguf(allocator: std.mem.Allocator, path: []const u8) Error!void {
