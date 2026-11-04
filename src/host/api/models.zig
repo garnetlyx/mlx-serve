@@ -14,6 +14,8 @@ const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
+const gguf_root = @import("../../sdk/quant/gguf/root.zig");
 const EngineKind = @import("../engines/served.zig").Kind;
 const media_mod = @import("../media_jobs/gen.zig");
 const metrics = @import("../status.zig");
@@ -71,6 +73,29 @@ fn mlxGgufClaims(io: std.Io, entry: *LoadedModel) bool {
         entry.mlx_gguf_claim = p != null;
     }
     return entry.mlx_gguf_claim.?;
+}
+
+/// This (unloaded) entry's `<arch>.context_length` GGUF metadata key — read
+/// generically off the file's own KV store (the standard llama.cpp/GGUF
+/// naming convention) rather than through the MLX engine's Arch table, so a
+/// ds4-only arch (deepseek4, glm-dsa, glm5-next) advertises its trained
+/// context too. 0 when the file/arch can't be read or carries no such key.
+fn ggufContextCap(io: std.Io, entry: *LoadedModel) u32 {
+    if (entry.gguf_ctx_cap) |v| return v;
+    const allocator = std.heap.page_allocator;
+    const cap: u32 = blk: {
+        const path = gguf_files.resolveGgufFile(io, allocator, entry.path) catch break :blk 0;
+        defer allocator.free(path);
+        var f = gguf_root.gguf.File.open(allocator, path) catch break :blk 0;
+        defer f.deinit();
+        const arch = f.getString("general.architecture") orelse break :blk 0;
+        var kb: [128]u8 = undefined;
+        const key = std.fmt.bufPrint(&kb, "{s}.context_length", .{arch}) catch break :blk 0;
+        const v = f.getInt(key) orelse break :blk 0;
+        break :blk if (v > 0) @as(u32, @intCast(@min(v, std.math.maxInt(u32)))) else 0;
+    };
+    entry.gguf_ctx_cap = cap;
+    return cap;
 }
 
 /// Render the JSON metadata fragment for one entry. For `.ready` entries
@@ -436,6 +461,12 @@ pub fn renderModelEntry(
             sm.max_position_embeddings,
             sm.max_position_embeddings,
         });
+    } else if (is_gguf_stub) blk: {
+        // No config.json to read (issue #59); fall back to the GGUF's own
+        // metadata so a ds4-routed arch still advertises a context window.
+        const cap = ggufContextCap(io, entry);
+        if (cap == 0) break :blk @as([]const u8, &[_]u8{});
+        break :blk try std.fmt.allocPrint(allocator, ",\"context_length\":{d},\"max_model_len\":{d}", .{ cap, cap });
     } else &[_]u8{};
     defer if (top_ctx_part.len > 0) allocator.free(top_ctx_part);
 
@@ -1027,6 +1058,56 @@ fn inputModalities(a: std.mem.Allocator, vision: bool, video: bool, audio: bool)
     return std.fmt.allocPrint(a, "[\"text\"{s}{s}{s}]", .{
         if (vision) ",\"image\"" else "", if (video) ",\"video\"" else "", if (audio) ",\"audio\"" else "",
     });
+}
+
+test "an unloaded GGUF stub reports context_length from its own <arch>.context_length key, not just config.json" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Minimal GGUF, zero tensors: magic, version, n_tensors=0, n_kv=2, then
+    // the two KVs, following gguf.zig's own TestWriter idiom. "glm-dsa" is
+    // not in the MLX engine's Arch table (ds4-only), so this also proves the
+    // read does not go through Arch/configJson.
+    const W = struct {
+        buf: std.ArrayList(u8) = .empty,
+        a: std.mem.Allocator,
+        fn num(self: *@This(), v: anytype) !void {
+            try self.buf.appendSlice(self.a, std.mem.asBytes(&v));
+        }
+        fn str(self: *@This(), s: []const u8) !void {
+            try self.num(@as(u64, s.len));
+            try self.buf.appendSlice(self.a, s);
+        }
+    };
+    var w = W{ .a = a };
+    defer w.buf.deinit(a);
+    try w.buf.appendSlice(a, "GGUF");
+    try w.num(@as(u32, 3));
+    try w.num(@as(u64, 0)); // n_tensors
+    try w.num(@as(u64, 2)); // n_kv
+    try w.str("general.architecture");
+    try w.num(@as(u32, 8)); // string
+    try w.str("glm-dsa");
+    try w.str("glm-dsa.context_length");
+    try w.num(@as(u32, 10)); // u64
+    try w.num(@as(u64, 131072));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = w.buf.items });
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStubWithArch("glm-stub", path, 0, "gguf");
+    const json = try renderModelEntry(a, io, entry);
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 131072), parsed.value.object.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 131072), parsed.value.object.get("max_model_len").?.integer);
+    // Memoized: a second render reuses entry.gguf_ctx_cap instead of reopening the file.
+    try testing.expectEqual(@as(u32, 131072), entry.gguf_ctx_cap.?);
 }
 
 test "an unloaded pack that sees and hears lists both, as its loaded row does" {

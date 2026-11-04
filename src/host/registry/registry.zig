@@ -248,6 +248,13 @@ pub const LoadedModel = struct {
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
+    /// This (unloaded) GGUF entry's own `<arch>.context_length` GGUF metadata
+    /// key (the standard llama.cpp convention), read straight off the file's KV
+    /// store regardless of whether the MLX engine's Arch table claims the arch —
+    /// a ds4-only arch (deepseek4, glm-dsa, glm5-next) still advertises its
+    /// trained context this way. 0 = no such key or the file/arch couldn't be
+    /// read; answered once, like the claim above.
+    gguf_ctx_cap: ?u32 = null,
     /// The engines whose probe accepts this pack (`model_row_facts.Engines` bits); answered once, like the claim.
     engines: ?u8 = null,
 
