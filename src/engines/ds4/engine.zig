@@ -83,7 +83,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             vocab: usize,
             eos: []u32,
             tokens: TokenTable,
-            file_bytes: u64,
+            mapped_bytes: u64,
             template: []const u8,
             /// The last prompt as the client sent it, and where its reply began in the session (the length of the
             /// prompt synced for it): `keptReply` continues a conversation whose copies of past replies differ.
@@ -111,7 +111,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
 
         /// What the GGUF header says about the open: its trained window and whether
         /// ds4's own encoder is the chat format (DeepSeek-V4's DSML) rather than the template the GGUF ships.
-        const Meta = struct { trained: u32 = 0, ds4_encodes: bool = true };
+        const Meta = struct { trained: u32 = 0, disk_only: u64 = 0, ds4_encodes: bool = true };
 
         fn ggufMeta(path: []const u8) Meta {
             var info = engine_pick.readFromFile(io, gpa, path) catch return .{};
@@ -119,6 +119,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             const arch = info.architecture orelse "";
             return .{
                 .trained = info.context_length,
+                .disk_only = info.ds4_disk_only_bytes,
                 .ds4_encodes = std.mem.eql(u8, arch, "deepseek4") or std.mem.eql(u8, arch, "deepseek41"),
             };
         }
@@ -137,11 +138,11 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             return vision_mod.tokens(io, gpa, path);
         }
 
-        /// The GGUF and ds4's own estimate of the session's KV and scratch.
+        /// Resident GGUF bytes plus the session's KV and scratch estimate.
         fn loadBytes(o: *const abi.Open, bytes: *u64) callconv(.c) abi.Verdict {
             const path = abi.items(u8, o.model_dir);
             const meta = ggufMeta(path);
-            bytes.* = fileBytes(path) + B.contextBytes(askedContext(o, meta));
+            bytes.* = (fileBytes(path) -| meta.disk_only) + B.contextBytes(askedContext(o, meta));
             return .{};
         }
 
@@ -209,7 +210,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .vocab = vocab,
                 .eos = try eos.toOwnedSlice(gpa),
                 .tokens = tokens,
-                .file_bytes = fileBytes(path),
+                .mapped_bytes = fileBytes(path) -| meta.disk_only,
                 .template = template,
                 .vision = vision,
                 .disk = openDisk(engine, path, ctx, template, flags),
@@ -335,10 +336,10 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             state(e).book.status(out);
         }
 
-        /// What props has always shown for ds4: the GGUF plus the session's estimate (ds4 allocates outside MLX).
+        /// ds4 allocates outside MLX; report its resident file region and session estimate.
         fn memory(e: *anyopaque, out: *abi.Memory) callconv(.c) void {
             const st = state(e);
-            const active = st.file_bytes + B.contextBytes(st.ctx);
+            const active = st.mapped_bytes + B.contextBytes(st.ctx);
             out.* = .{ .active = active, .cache = 0, .peak = active };
         }
 
@@ -877,6 +878,56 @@ test "ds4 adapter: an unset context opens the checkpoint's trained window, ds4's
 test "ds4 adapter: an explicit context is the session, never the trained window or a silent fallback" {
     try testing.expectEqual(@as(?u32, 65536), try openedContext(262144, 65536));
     try testing.expectEqual(@as(?u32, null), try openedContext(262144, 2 * FakeBridge.session_cap));
+}
+
+test "GGUF accounting: ds4 load and memory reports exclude validated disk-only tensors" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "model.gguf" });
+    defer testing.allocator.free(path);
+    var host: abi.Host = .{ .ctx = undefined, .log = struct {
+        fn f(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
+    }.f, .wake = struct {
+        fn f(_: *anyopaque) callconv(.c) void {}
+    }.f };
+    for ([_]bool{ false, true }) |engram| {
+        const tensors = [_]engine_pick.TensorInfo{
+            .{ .name = if (engram) "blk.1.engram_embd.weight" else "per_layer_token_embd.weight", .ggml_type = if (engram) 24 else 30, .dims = if (engram) &.{ 264, 1024 } else &.{ 160, 1024 } },
+            .{ .name = "blk.14.engram_embd.weight", .ggml_type = 24, .dims = &.{ 264, 1024 }, .offset = 1 << 19 },
+        };
+        const header = try engine_pick.buildHeaderWithTensors(testing.allocator, &.{
+            .{ .key = "general.architecture", .value = .{ .str = if (engram) "deepseek41" else "qwen4exp" } },
+            .{ .key = if (engram) "deepseek41.context_length" else "qwen4exp.context_length", .value = .{ .u32_v = 8192 } },
+            .{ .key = "general.alignment", .value = .{ .u32_v = @intCast(std.heap.pageSize()) } },
+            .{ .key = "deepseek41.engram.encoding", .value = .{ .str = "e4m3_e8m0_32_row264" } },
+        }, tensors[0..@as(usize, if (engram) 2 else 1)]);
+        defer testing.allocator.free(header);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = header });
+        const file = try tmp.dir.createFile(io, "model.gguf", .{ .truncate = false });
+        defer file.close(io);
+        const file_bytes: u64 = 1 << 20;
+        try file.setLength(io, file_bytes);
+        for ([_]u32{ 0, 4096 }) |asked| {
+            const o: abi.Open = .{ .model_dir = .of(path), .model_type = .{}, .config_json = .{}, .context = asked, .max_concurrent = 1, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &host };
+            const context = if (asked == 0) 8192 else asked;
+            const disk_bytes: u64 = if (engram) 2 * 264 * 1024 else 160 * 1024 * 2;
+            const expected = file_bytes - disk_bytes + FakeBridge.contextBytes(context);
+            var bill: u64 = 0;
+            try testing.expect(Fake.table.load_bytes(&o, &bill).isOk());
+            try testing.expectEqual(expected, bill);
+            var info: abi.Info = undefined;
+            var verdict: abi.Verdict = .{};
+            const engine = Fake.table.open(&o, &info, &verdict) orelse return error.TestUnexpectedResult;
+            defer Fake.table.close(engine);
+            var memory: abi.Memory = .{};
+            Fake.table.memory(engine, &memory);
+            try testing.expectEqual(expected, memory.active);
+            try testing.expectEqual(expected, memory.peak);
+            try testing.expectEqual(context, info.context_window);
+        }
+    }
 }
 
 /// A ds4-routed GGUF of `arch` in `tmp`, declaring `template` as its chat template when set.
