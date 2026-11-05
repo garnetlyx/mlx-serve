@@ -78,6 +78,6 @@ test "open: a support GGUF beside the model reaches ds4 only for an arch that ta
                 }
             };
         };
-        try std.testing.expectError(error.Opened, open(B, io, std.testing.allocator, path, .{}));
+        try std.testing.expectError(error.Opened, open(B, io, std.testing.allocator, path, .{}, 4096));
     }
 }
