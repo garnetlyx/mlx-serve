@@ -81,6 +81,8 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             tokens: TokenTable,
             mapped_bytes: u64,
             template: []const u8,
+            /// Where the last reply began in the session: the length of the prompt it answered.
+            reply_start: usize = 0,
             thread: std.Thread = undefined,
             startup_buf: [96]u8 = undefined,
         };
@@ -305,19 +307,51 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             }
         }
 
+        /// How far before the last reply a client's copy of it may diverge: the reasoning opener of the generation
+        /// prompt, which a template renders differently in history.
+        const reply_opener_tokens = 4;
+
+        const Kept = struct { tokens: []i32, covered: usize };
+
+        /// A client's copy of the reply this session generated last can differ from what was sampled (reasoning left
+        /// out, a tool call re-serialized), and ds4 cannot rewind a hybrid model's state into it, so a plain sync
+        /// replays the whole prompt. When `prompt` leaves the live session inside that reply, keep the sampled reply
+        /// and prefill only what follows the client's copy, from its end-of-turn token on. Null: sync `prompt` as is.
+        fn keptReply(st: *State, prompt: []const i32, max_tokens: u32) !?Kept {
+            if (st.reply_start == 0) return null;
+            const live = try st.session.liveTokens(gpa);
+            defer gpa.free(live);
+            if (live.len <= st.reply_start) return null;
+            const common = std.mem.indexOfDiff(i32, live, prompt) orelse return null;
+            if (common >= live.len or common + reply_opener_tokens < st.reply_start) return null;
+            const end = for (prompt[common..], common..) |t, i| {
+                if (std.mem.indexOfScalar(u32, st.eos, @intCast(t)) != null) break i;
+            } else return null;
+            const len = live.len + (prompt.len - end);
+            if (len + max_tokens > st.ctx) return null;
+            const tokens = try gpa.alloc(i32, len);
+            @memcpy(tokens[0..live.len], live);
+            @memcpy(tokens[live.len..], prompt[end..]);
+            return .{ .tokens = tokens, .covered = end };
+        }
+
         /// Sync the session to the prompt (ds4 keeps the common prefix in its live KV), then decode round by round.
         fn serve(st: *State, r: *Req) !Reason {
             if (r.isCancelled()) return .cancelled;
             const prompt = try gpa.alloc(i32, r.prompt.len);
             defer gpa.free(prompt);
             for (r.prompt, prompt) |t, *p| p.* = @intCast(t);
-            const cached = st.session.commonPrefix(prompt) catch 0;
-            st.session.sync(prompt, &r.cancelled) catch |err| switch (err) {
+            const kept = try keptReply(st, prompt, r.max_tokens);
+            defer if (kept) |k| gpa.free(k.tokens);
+            const synced = if (kept) |k| k.tokens else prompt;
+            const cached: usize = if (kept) |k| k.covered else @intCast(@max(st.session.commonPrefix(prompt) catch 0, 0));
+            st.session.sync(synced, &r.cancelled) catch |err| switch (err) {
                 // ds4 rebuilds a half-done pass on the next sync; the complete prefix stays cached.
                 error.SyncInterrupted => return .cancelled,
                 else => return err,
             };
-            if (r.prefilled(@intCast(@max(cached, 0)))) |why| return why;
+            st.reply_start = synced.len;
+            if (r.prefilled(@intCast(cached))) |why| return why;
 
             var rng = r.seed();
             const d: round.Draw = .{ .temperature = r.sampling.temperature, .top_k = r.sampling.top_k, .top_p = r.sampling.top_p, .min_p = r.sampling.min_p, .rng = &rng };
@@ -477,6 +511,9 @@ const FakeBridge = struct {
         }
         pub fn invalidate(s: *Ds4Session) void {
             s.toks.clearRetainingCapacity();
+        }
+        pub fn liveTokens(s: *Ds4Session, a: std.mem.Allocator) ![]i32 {
+            return a.dupe(i32, s.toks.items);
         }
         pub fn commonPrefix(s: *Ds4Session, p: []const i32) !i32 {
             var n: usize = 0;
@@ -657,6 +694,56 @@ test "ds4 adapter: a GGUF's own chat template goes to the host's Jinja, except D
 
     const bare = try rendering("qwen4exp", null, &tbuf);
     try testing.expect(!bare.host_renders);
+}
+
+/// Runs `prompts` one after another on one opened session (plain greedy rounds, 3 tokens each); the tokens the
+/// session holds afterwards, copied into `out`.
+fn liveAfter(path: []const u8, prompts: []const []const u32, out: []i32) ![]i32 {
+    var host: abi.Host = .{ .ctx = undefined, .log = struct {
+        fn f(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
+    }.f, .wake = struct {
+        fn f(_: *anyopaque) callconv(.c) void {}
+    }.f };
+    const o: abi.Open = .{ .model_dir = abi.span(u8, path), .model_type = .{}, .config_json = .{}, .context = 0, .max_concurrent = 1, .memory_budget = 0, .settings_json = abi.span(u8, "{\"prefill_chunk\":1}"), .options_json = .{}, .host = &host };
+    var info: abi.Info = undefined;
+    var v: abi.Verdict = .{};
+    const e = Fake.table.open(&o, &info, &v) orelse return error.Open;
+    defer Fake.table.close(e);
+    for (prompts, 1..) |p, id| {
+        var c: Collect = .{};
+        defer c.deinit();
+        const req: abi.Request = .{ .prompt = abi.span(u32, p), .max_tokens = 3, .sampling = .{ .temperature = 0 } };
+        if (Fake.table.submit(e, id, &req, c.sink()).code != .ok) return error.Refused;
+        c.wait();
+    }
+    const live = Fake.state(e).session.toks.items;
+    @memcpy(out[0..live.len], live);
+    return out[0..live.len];
+}
+
+test "ds4 adapter: a client's copy of the last reply stands in for the sampled one; only what follows it is prefilled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try ds4Gguf(&tmp, &buf);
+    const turn1 = [_]u32{ 5, 6, 7, 8, 10, 11, 12, 13, 14, 15 };
+    var one_buf: [64]i32 = undefined;
+    const one = try liveAfter(path, &.{&turn1}, &one_buf);
+    try testing.expect(one.len > turn1.len);
+
+    // The client's copy of the reply ([9, 9]) differs from what was sampled; then its end of turn (2) and a new turn.
+    const turn2 = turn1 ++ [_]u32{ 9, 9, 2, 16 };
+    var two_buf: [64]i32 = undefined;
+    const two = try liveAfter(path, &.{ &turn1, &turn2 }, &two_buf);
+    try testing.expectEqualSlices(i32, one, two[0..one.len]);
+    try testing.expectEqualSlices(i32, &.{ 2, 16 }, two[one.len .. one.len + 2]);
+
+    // A history that changed before the reply is synced as sent.
+    const edited = [_]u32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 2, 16 };
+    var three_buf: [64]i32 = undefined;
+    const three = try liveAfter(path, &.{ &turn1, &edited }, &three_buf);
+    const want = [_]i32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 2, 16 };
+    try testing.expectEqualSlices(i32, &want, three[0..want.len]);
 }
 
 const Collect = struct {

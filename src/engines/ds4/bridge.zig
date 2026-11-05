@@ -552,6 +552,11 @@ pub const Ds4Session = struct {
         self.allocator.destroy(self);
     }
 
+    /// The tokens the live session holds: the last synced prompt, then what it evaluated. Caller frees.
+    pub fn liveTokens(self: *Ds4Session, allocator: std.mem.Allocator) Error![]i32 {
+        return tokensToOwnedSlice(allocator, ffi.ds4_session_tokens(self.handle));
+    }
+
     pub fn pos(self: *Ds4Session) i32 {
         return @intCast(ffi.ds4_session_pos(self.handle));
     }
