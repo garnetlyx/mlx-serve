@@ -136,12 +136,10 @@ const freeCpuState = @import("../../host/registry/cpu_state.zig").freeCpuState;
 pub const applyModelSettings = @import("../../host/registry/model_settings_apply.zig").applyModelSettings;
 const loadExceedsMemCap = @import("runtime/preflight.zig").loadExceedsMemCap;
 pub const gateEstimateBytes = @import("runtime/preflight.zig").gateEstimateBytes;
-const preflight = @import("runtime/preflight.zig");
 const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const pleTableBill = @import("runtime/preflight.zig").pleTableBill;
 const residentModelDiskBytes = @import("runtime/preflight.zig").residentModelDiskBytes;
 const residentGateBytes = @import("runtime/preflight.zig").residentGateBytes;
-const ggufGateBytes = @import("runtime/preflight.zig").ggufGateBytes;
 pub const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
 
 test {
@@ -812,8 +810,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         }
     else
         null;
-    const discovered_bytes = if (owned.gguf) |g| ggufGateBytes(entry.bytes_on_disk, g.disk_only_bytes) else entry.bytes_on_disk;
-    const resident_model_bytes = residentGateBytes(validated_model_bytes, discovered_bytes, mlx_text);
+    const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
     // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights, and its KV.
     const ane_bytes: ?u64 = if (mlx_text and engines_served.aneWanted(owned.config, self.ane))
         engines_load.aneBytes(self.allocator, entry.path, self.ane_slots)
@@ -851,7 +848,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
         // One ds4 engine per process: an idle resident ds4 model goes first, a busy one refuses this load.
         const incoming_ds4 = if (owned.gguf) |g| g.engine == .ds4 else false;
-        if (incoming_ds4) entry.ds4_route = true;
+        entry.ds4_route = incoming_ds4;
         const ds4_victim = try self.registry.ds4EngineVictimLocked(entry.id, incoming_ds4);
 
         // Claim the slot.
@@ -863,8 +860,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
 
         // Estimate post-load bytes (see `gateEstimateBytes` for why a media
         // entry cannot be billed by its directory's size).
-        const ds4_streamed = if (owned.gguf) |g| g.engine == .ds4 and self.ds4_ssd_streaming else false;
-        const estimated: u64 = preflight.gateEstimateBytesFor(media_peak, gate_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size, if (ds4_streamed) mlx.maxRecommendedWorkingSet() else 0) +
+        const estimated: u64 = gateEstimateBytes(media_peak, gate_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size) +
             pleTableBill(self.io, owned.config);
 
         // Reserve this load's estimate BEFORE planning eviction, so a

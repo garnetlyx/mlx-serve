@@ -25,6 +25,7 @@ const tokenize_cache_mod = @import("../tokenizer/cache.zig");
 const token_mask_mod = @import("../../sdk/grammar/token_mask.zig");
 const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const model_discovery = @import("discovery.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const load_progress = @import("load_progress.zig");
 const Served = @import("../engines/served.zig").Served;
@@ -166,6 +167,10 @@ pub const LoadedModel = struct {
     /// `path` with symlinks resolved, so a request naming the same directory
     /// another way finds this entry (`peekByPath`). Empty when it does not resolve.
     real_path: []const u8 = "",
+    /// Hex sha256 of this load's `config.json` for the ablation profile check (`api/ablation.zig` `modelDigest`): taken
+    /// once, by the first ablated request. `config_digest_state` 0 = not taken, 1 = being taken, 2 = ready.
+    config_digest: [64]u8 = undefined,
+    config_digest_state: std.atomic.Value(u8) = .init(0),
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
@@ -242,19 +247,12 @@ pub const LoadedModel = struct {
     /// An engine beside MLX serving this model (ds4 or llama.cpp for a GGUF, the Neural Engine for an MLX pack;
     /// `host/engines/`): the MLX fields stay null. A GGUF's tokenizer and template are the engine's.
     engine: ?*Served = null,
-    /// This entry's GGUF routes to the embedded ds4 engine (set when its load claims the slot; the route is a
-    /// property of the file, so it stays set). ds4 is one engine per process: see `ds4EngineVictimLocked`.
+    /// This load claims the process's ds4 engine; retained through eviction. Loading claims set it before
+    /// native open; publication derives it from the opened engine, including eager startup loads.
     ds4_route: bool = false,
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
-    /// This (unloaded) GGUF entry's own `<arch>.context_length` GGUF metadata
-    /// key (the standard llama.cpp convention), read straight off the file's KV
-    /// store regardless of whether the MLX engine's Arch table claims the arch —
-    /// a ds4-only arch (deepseek4, glm-dsa, glm5-next) still advertises its
-    /// trained context this way. 0 = no such key or the file/arch couldn't be
-    /// read; answered once, like the claim above.
-    gguf_ctx_cap: ?u32 = null,
     /// The engines whose probe accepts this pack (`model_row_facts.Engines` bits); answered once, like the claim.
     engines: ?u8 = null,
 
@@ -493,7 +491,6 @@ pub const LoadedModel = struct {
             self.tokenize_cache = null;
         }
     }
-
 };
 
 /// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
@@ -785,7 +782,27 @@ pub const ModelRegistry = struct {
             defer self.mutex.unlock(self.io);
             if (self.peekByPathLocked(path)) |e| return e;
         }
-        // The same directory under another spelling: a symlink, either way round.
+        if (self.peekByRealPath(path)) |e| return e;
+        // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it. Only the file the
+        // folder serves: another quant beside it is a model of its own.
+        if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| if (self.peekByPath(dir)) |e| {
+            if (self.folderServes(e.path, path)) return e;
+        };
+        return null;
+    }
+
+    fn folderServes(self: *ModelRegistry, folder: []const u8, file: []const u8) bool {
+        const pick = gguf_files.resolveGgufFile(self.io, self.allocator, folder) catch return false;
+        defer self.allocator.free(pick);
+        var a: [std.fs.max_path_bytes]u8 = undefined;
+        var b: [std.fs.max_path_bytes]u8 = undefined;
+        const ra = a[0 .. std.Io.Dir.realPathFileAbsolute(self.io, pick, &a) catch return false];
+        const rb = b[0 .. std.Io.Dir.realPathFileAbsolute(self.io, file, &b) catch return false];
+        return std.mem.eql(u8, ra, rb);
+    }
+
+    /// The same directory under another spelling: a symlink, either way round.
+    fn peekByRealPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         if (!std.fs.path.isAbsolute(path)) return null;
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const real = buf[0 .. std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return null];
@@ -1084,10 +1101,8 @@ pub const ModelRegistry = struct {
         return null;
     }
 
-    /// ds4 runs one engine per process: it holds a process-wide instance lock and model-family globals, and a
-    /// second open exit()s the process. So before a load that opens ds4 (`incoming_ds4`), another ds4 entry is
-    /// the forced eviction victim when idle; one in use, loading or evicting refuses the load with
-    /// `error.Ds4EngineBusy` instead.
+    /// ds4 has process-wide model globals and exits on a second open. Evict an idle owner; refuse another load
+    /// while that owner is busy, loading or evicting.
     pub fn ds4EngineVictimLocked(self: *ModelRegistry, exclude_id: []const u8, incoming_ds4: bool) error{Ds4EngineBusy}!?*LoadedModel {
         if (!incoming_ds4) return null;
         var it = self.entries.valueIterator();
@@ -1199,6 +1214,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         generations().last_unload.consume(bytes_resident);
+        entry.ds4_route = if (entry.engine) |engine| engine.kind == .ds4 else false;
         entry.state = .ready;
         entry.error_name = null;
         self.lru_clock += 1;
@@ -1624,6 +1640,40 @@ test "ModelRegistry: peekByPath finds an entry through a symlinked path in eithe
     defer reg2.deinit();
     const via_real = try reg2.registerStubWithArch("m", real, 64, "qwen3");
     try testing.expectEqual(via_real, reg2.peekByPath(link) orelse return error.TestUnexpectedResult);
+}
+
+test "ModelRegistry: peekByPath finds a GGUF pack by the .gguf file inside it, also through a symlink" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real/pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pack/m.gguf", .data = "GGUF" });
+    try tmp.dir.createDirPath(io, "links");
+    try tmp.dir.symLink(io, "../real/pack", "links/pack", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const link = try std.fs.path.join(testing.allocator, &.{ root, "links", "pack" });
+    defer testing.allocator.free(link);
+    const real_file = try std.fs.path.join(testing.allocator, &.{ root, "real", "pack", "m.gguf" });
+    defer testing.allocator.free(real_file);
+    const link_file = try std.fs.path.join(testing.allocator, &.{ root, "links", "pack", "m.gguf" });
+    defer testing.allocator.free(link_file);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("pack", link, 64, "gguf");
+    try testing.expectEqual(e, reg.peekByPath(link_file) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(e, reg.peekByPath(real_file) orelse return error.TestUnexpectedResult);
+    // Another quant beside the one the folder serves is not that entry.
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pack/z.gguf", .data = "GGUF" });
+    const other = try std.fs.path.join(testing.allocator, &.{ root, "real", "pack", "z.gguf" });
+    defer testing.allocator.free(other);
+    try testing.expect(reg.peekByPath(other) == null);
+    try testing.expectEqual(e, reg.peekByPath(real_file) orelse return error.TestUnexpectedResult);
+    // Only a .gguf falls back to its folder.
+    const readme = try std.fs.path.join(testing.allocator, &.{ link, "README.md" });
+    defer testing.allocator.free(readme);
+    try testing.expect(reg.peekByPath(readme) == null);
 }
 
 test "ModelRegistry: registerByPath rejects a nonexistent directory" {
@@ -2530,29 +2580,75 @@ test "ModelRegistry: registerByPath registers under the caller's org/name id" {
 test "ModelRegistry: a second ds4 GGUF unloads an idle ds4 model and is refused by a busy one" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
-    const glm = try makeReadyStub(reg, "glm-gguf", 180_000_000_000);
-    glm.ds4_route = true;
-    const mlx = try makeReadyStub(reg, "qwen-mlx", 20_000_000_000);
-    const deepseek = try beginLoad(reg, "deepseek-gguf", 100);
+    const first = try makeReadyStub(reg, "first-gguf", 180_000_000_000);
+    first.ds4_route = true;
+    const plain = try makeReadyStub(reg, "plain", 20_000_000_000);
+    const second = try beginLoad(reg, "second-gguf", 100);
 
     reg.mutex.lockUncancelable(reg.io);
     defer reg.mutex.unlock(reg.io);
     // A load that does not open ds4 is unaffected; a reload of the same id is not a second engine.
-    try testing.expect(try reg.ds4EngineVictimLocked("qwen-mlx", false) == null);
-    try testing.expect(try reg.ds4EngineVictimLocked("glm-gguf", true) == null);
-    _ = mlx;
+    try testing.expect(try reg.ds4EngineVictimLocked("plain", false) == null);
+    try testing.expect(try reg.ds4EngineVictimLocked("first-gguf", true) == null);
     // Busy: refused, nothing marked.
-    _ = glm.refcount.fetchAdd(1, .acq_rel);
-    try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked("deepseek-gguf", true));
-    glm.refcount.store(0, .release);
+    _ = first.refcount.fetchAdd(1, .acq_rel);
+    try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked("second-gguf", true));
+    try testing.expectEqual(LoadState.ready, first.state);
+    try testing.expectEqual(LoadState.ready, plain.state);
+    first.refcount.store(0, .release);
     // Idle: the plan evicts it although both caps hold.
-    const victim = (try reg.ds4EngineVictimLocked("deepseek-gguf", true)).?;
-    try testing.expectEqualStrings("glm-gguf", victim.id);
+    const victim = (try reg.ds4EngineVictimLocked("second-gguf", true)).?;
+    try testing.expectEqualStrings("first-gguf", victim.id);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(deepseek.id, victim, &buf, 0));
-    try testing.expectEqual(LoadState.evicting, glm.state);
-    reg.unmarkEvictingLocked(glm);
-    reg.markUnloadedLocked(deepseek);
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(second.id, victim, &buf, 0));
+    try testing.expectEqual(LoadState.evicting, first.state);
+    try testing.expectEqual(LoadState.ready, plain.state);
+    reg.unmarkEvictingLocked(first);
+    reg.markUnloadedLocked(second);
+}
+
+test "ModelRegistry: a second ds4 GGUF is refused while the owner is loading or evicting" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const first = try makeReadyStub(reg, "first-gguf", 100);
+    first.ds4_route = true;
+    const second = try reg.registerStub("second-gguf", "/second-gguf", 100);
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    for ([_]LoadState{ .loading, .evicting }) |state| {
+        first.state = state;
+        try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked(second.id, true));
+        try testing.expectEqual(state, first.state);
+        try testing.expectEqual(LoadState.unloaded, second.state);
+        try testing.expect(try reg.ds4EngineVictimLocked(second.id, false) == null);
+    }
+    first.state = .ready;
+    try testing.expectEqual(first, (try reg.ds4EngineVictimLocked(second.id, true)).?);
+    reg.markUnloadedLocked(first);
+    try testing.expect(try reg.ds4EngineVictimLocked(second.id, true) == null);
+}
+
+test "ModelRegistry: ds4 ownership follows the published native engine including eager loads" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const first = try reg.registerStub("first-gguf", "/first-gguf", 100);
+    var engine: Served = undefined;
+    engine.kind = .ds4;
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expect(reg.tryBeginLoadLocked(first));
+    try testing.expect(!first.ds4_route);
+    first.engine = &engine;
+    defer first.engine = null;
+    reg.markReadyLocked(first, 100);
+    try testing.expect(first.ds4_route);
+    try testing.expectEqual(first, (try reg.ds4EngineVictimLocked("second-gguf", true)).?);
+    reg.markUnloadedLocked(first);
+    try testing.expect(reg.tryBeginLoadLocked(first));
+    engine.kind = .llama;
+    reg.markReadyLocked(first, 100);
+    try testing.expect(!first.ds4_route);
+    try testing.expect(try reg.ds4EngineVictimLocked("second-gguf", true) == null);
 }
 
 test "ModelRegistry: a second stream pack that reads the foreign bytes unloads an idle one and is refused by a busy one" {

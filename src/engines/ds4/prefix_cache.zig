@@ -1,11 +1,9 @@
 //! Native ds4 SSD checkpoints. The owning inference thread serializes every call.
 //! Main stores once after a successful cold prefill, then before destructive replacement/close;
 //! warm tool turns stay in the live session. Store requires the exact live token history.
-//! Budget is one root-wide cap; other engines' actual files reduce each write allowance.
 
 const std = @import("std");
 const log = @import("../../sdk/util/log.zig");
-const disk_budget = @import("../../sdk/kv/disk_budget.zig");
 
 pub const Identity = struct {
     /// Runtime/build identity, including native payload implementation changes.
@@ -20,7 +18,7 @@ pub const Identity = struct {
 
 pub const Options = struct {
     home: []const u8,
-    /// Single root-wide disk cap, including all other engines' caches.
+    /// Independent budget for the native ds4 pool.
     budget_bytes: u64,
     identity: Identity,
     /// Zero uses the native default (512); it does not disable the minimum.
@@ -57,42 +55,30 @@ extern fn mlxserve_ds4_kv_cache_open(engine: *anyopaque, dir: [*:0]const u8, nam
 extern fn mlxserve_ds4_kv_cache_close(cache: *Native) void;
 extern fn mlxserve_ds4_kv_cache_store(cache: *Native, session: *anyopaque, tokens: [*]const i32, count: c_int, reason: [*:0]const u8, err: [*]u8, errlen: usize) c_int;
 extern fn mlxserve_ds4_kv_cache_restore(cache: *Native, session: *anyopaque, target: [*]const i32, count: c_int, err: [*]u8, errlen: usize) c_int;
-extern fn mlxserve_ds4_kv_cache_physical_bytes(cache: *Native) u64;
-extern fn mlxserve_ds4_kv_cache_set_budget(cache: *Native, bytes: u64, err: [*]u8, errlen: usize) c_int;
-extern fn mlxserve_ds4_kv_cache_prune(cache: *Native, err: [*]u8, errlen: usize) c_int;
 
 /// `B` is bridge.zig; only its engine/session handle fields cross the C boundary.
 pub fn Cache(comptime B: type) type {
     return struct {
         const Self = @This();
         allocator: std.mem.Allocator,
-        io: std.Io,
         handle: *Native,
-        base: []u8,
-        root: [:0]u8,
-        total_cap: u64,
 
         pub fn open(io: std.Io, gpa: std.mem.Allocator, engine: *B.Ds4Engine, model_path: []const u8, options: Options) !Self {
             const ns = try namespace(io, gpa, model_path, options.identity);
             defer gpa.free(ns);
             const dir = try poolDir(gpa, options.home);
-            errdefer gpa.free(dir);
-            const base = try std.fmt.allocPrint(gpa, "{s}/.mlx-serve/kv-cache", .{options.home});
-            errdefer gpa.free(base);
-            const allowance = try disk_budget.availableBudget(gpa, io, base, dir, options.budget_bytes, 0);
+            defer gpa.free(dir);
             var err: [256]u8 = @splat(0);
-            const handle = mlxserve_ds4_kv_cache_open(@ptrCast(engine.handle), dir, ns, allowance orelse 0, options.min_tokens, &err, err.len) orelse {
+            const handle = mlxserve_ds4_kv_cache_open(@ptrCast(engine.handle), dir, ns, options.budget_bytes, options.min_tokens, &err, err.len) orelse {
                 report("open", &err);
                 return error.Ds4PrefixCacheOpen;
             };
-            return .{ .allocator = gpa, .io = io, .handle = handle, .base = base, .root = dir, .total_cap = options.budget_bytes };
+            return .{ .allocator = gpa, .handle = handle };
         }
 
         /// Flush the session with store(.close) before deinit; the cache never owns it.
         pub fn deinit(self: *Self) void {
             mlxserve_ds4_kv_cache_close(self.handle);
-            self.allocator.free(self.base);
-            self.allocator.free(self.root);
             self.* = undefined;
         }
 
@@ -100,7 +86,6 @@ pub fn Cache(comptime B: type) type {
         /// boundary rejects invalid (including interrupted) and image-conditioned sessions.
         pub fn store(self: *Self, session: *B.Ds4Session, prompt: []const i32, reason: Reason) !bool {
             if (prompt.len > std.math.maxInt(c_int)) return error.Ds4PrefixCachePromptTooLong;
-            try self.refreshBudget();
             var err: [256]u8 = @splat(0);
             const rc = mlxserve_ds4_kv_cache_store(self.handle, @ptrCast(session.handle), prompt.ptr, @intCast(prompt.len), reason.native(), &err, err.len);
             if (rc < 0) {
@@ -129,46 +114,6 @@ pub fn Cache(comptime B: type) type {
             }
             const n: usize = @intCast(rc);
             return .{ .tokens = tokens[0..n], .cached_tokens = n, .allocation = tokens };
-        }
-
-        /// Actual file lengths, including unindexed/corrupt files. maxInt(u64) on scan
-        /// failure is conservative when main subtracts this from the total cache budget.
-        pub fn physicalDiskBytes(self: *Self) u64 {
-            return mlxserve_ds4_kv_cache_physical_bytes(self.handle);
-        }
-
-        /// Update the single root-wide cap. Zero stops writes while retaining
-        /// read-only restores; call prune explicitly to remove those checkpoints.
-        pub fn setBudget(self: *Self, bytes: u64) !void {
-            self.total_cap = bytes;
-            try self.refreshBudget();
-        }
-
-        fn applyAllowance(self: *Self, bytes: u64) !void {
-            var err: [256]u8 = @splat(0);
-            if (mlxserve_ds4_kv_cache_set_budget(self.handle, bytes, &err, err.len) != 0) {
-                report("budget", &err);
-                return error.Ds4PrefixCacheBudget;
-            }
-        }
-
-        /// Open and store refresh automatically; no other engine's files are deleted here.
-        pub fn refreshBudget(self: *Self) !void {
-            const allowance = disk_budget.availableBudget(self.allocator, self.io, self.base, self.root, self.total_cap, 0) catch |err| {
-                self.applyAllowance(0) catch |budget_err| {
-                    log.warn("[ds4-cache] disabling after budget scan failure: {t}\n", .{budget_err});
-                };
-                return err;
-            };
-            try self.applyAllowance(allowance orelse 0);
-        }
-
-        pub fn prune(self: *Self) !void {
-            var err: [256]u8 = @splat(0);
-            if (mlxserve_ds4_kv_cache_prune(self.handle, &err, err.len) != 0) {
-                report("prune", &err);
-                return error.Ds4PrefixCacheBudget;
-            }
         }
     };
 }

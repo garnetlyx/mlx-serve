@@ -1,6 +1,7 @@
 //! handleChatCompletions; constrained emit, handleNonStreamingGeneration
 
 const std = @import("std");
+const ablation = @import("ablation.zig");
 const abi = @import("../../abi/engine.zig");
 const schema_check = @import("schema_check.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -148,6 +149,11 @@ pub fn handleChatCompletions(
         return;
     }
     const root = parsed.value.object;
+    if (ablation.forRequest(stream, root, lm)) |r| {
+        log.warn("POST /v1/chat/completions -> {d} (ablation)\n", .{r.code});
+        try sendErrorResponse(allocator, stream, r.status, if (r.code == 401) "authentication_error" else "invalid_request_error", r.msg, r.code);
+        return;
+    }
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});

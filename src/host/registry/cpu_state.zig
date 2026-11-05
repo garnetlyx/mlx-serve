@@ -114,7 +114,7 @@ fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
 
     const engine = served.ggufEngine(io, allocator, gguf_path, forced);
     var state = try buildGgufStubCpuState(allocator, engine, ctx_size);
-    state.gguf = .{ .path = gguf_path, .engine = engine, .disk_only_bytes = if (engine == .ds4) gguf_meta.ds4DiskOnlyBytes(io, allocator, gguf_path) else 0 };
+    state.gguf = .{ .path = gguf_path, .engine = engine };
     return state;
 }
 

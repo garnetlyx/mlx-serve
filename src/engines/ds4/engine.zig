@@ -83,7 +83,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             vocab: usize,
             eos: []u32,
             tokens: TokenTable,
-            mapped_bytes: u64,
+            file_bytes: u64,
             template: []const u8,
             /// The last prompt as the client sent it, and where its reply began in the session (the length of the
             /// prompt synced for it): `keptReply` continues a conversation whose copies of past replies differ.
@@ -109,9 +109,9 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             return st.size;
         }
 
-        /// What the GGUF header says about the open: its trained window, the bytes ds4 never maps, and whether
+        /// What the GGUF header says about the open: its trained window and whether
         /// ds4's own encoder is the chat format (DeepSeek-V4's DSML) rather than the template the GGUF ships.
-        const Meta = struct { trained: u32 = 0, disk_only: u64 = 0, ds4_encodes: bool = true };
+        const Meta = struct { trained: u32 = 0, ds4_encodes: bool = true };
 
         fn ggufMeta(path: []const u8) Meta {
             var info = engine_pick.readFromFile(io, gpa, path) catch return .{};
@@ -119,7 +119,6 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             const arch = info.architecture orelse "";
             return .{
                 .trained = info.context_length,
-                .disk_only = info.ds4_disk_only_bytes,
                 .ds4_encodes = std.mem.eql(u8, arch, "deepseek4") or std.mem.eql(u8, arch, "deepseek41"),
             };
         }
@@ -138,11 +137,11 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             return vision_mod.tokens(io, gpa, path);
         }
 
-        /// The GGUF less what ds4 never maps, and ds4's own estimate of the session's KV and scratch.
+        /// The GGUF and ds4's own estimate of the session's KV and scratch.
         fn loadBytes(o: *const abi.Open, bytes: *u64) callconv(.c) abi.Verdict {
             const path = abi.items(u8, o.model_dir);
             const meta = ggufMeta(path);
-            bytes.* = (fileBytes(path) -| meta.disk_only) + B.contextBytes(askedContext(o, meta));
+            bytes.* = fileBytes(path) + B.contextBytes(askedContext(o, meta));
             return .{};
         }
 
@@ -210,7 +209,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .vocab = vocab,
                 .eos = try eos.toOwnedSlice(gpa),
                 .tokens = tokens,
-                .mapped_bytes = fileBytes(path) -| meta.disk_only,
+                .file_bytes = fileBytes(path),
                 .template = template,
                 .vision = vision,
                 .disk = openDisk(engine, path, ctx, template, flags),
@@ -339,7 +338,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         /// What props has always shown for ds4: the GGUF plus the session's estimate (ds4 allocates outside MLX).
         fn memory(e: *anyopaque, out: *abi.Memory) callconv(.c) void {
             const st = state(e);
-            const active = st.mapped_bytes + B.contextBytes(st.ctx);
+            const active = st.file_bytes + B.contextBytes(st.ctx);
             out.* = .{ .active = active, .cache = 0, .peak = active };
         }
 

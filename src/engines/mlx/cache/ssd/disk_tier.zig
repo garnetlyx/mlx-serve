@@ -55,7 +55,6 @@ const transformer_mod = @import("../../transformer.zig");
 const model = @import("../../../../sdk/config/model.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
-const disk_budget = @import("../../../../sdk/kv/disk_budget.zig");
 pub const module_record = @import("module_record.zig");
 const log = @import("../../../../sdk/util/log.zig");
 
@@ -414,7 +413,7 @@ pub const DiskTier = struct {
     io: std.Io,
     /// Absolute root for this model's entries (`<base>/<fingerprint>`). Owned.
     root: []u8,
-    /// This namespace's allowance after other cache roots are charged. 0 = intentionally unbounded.
+    /// Byte budget across all entries. 0 = unbounded.
     max_bytes: u64,
     chunk_tokens: u32,
     /// Max bytes written per appendCommit call (default 512 MB). The flush
@@ -444,9 +443,9 @@ pub const DiskTier = struct {
     operator_cap: u64 = 0,
     /// The free-space probe; tests arm a fixed answer with `armTestSpace`.
     space_probe: SpaceProbeFn = volumeSpace,
-    /// No disk headroom: new stores decline; existing entries remain restorable.
+    /// The volume is under `DISK_STORE_FLOOR`: no new entry persists, existing ones stay restorable.
     store_declined: bool = false,
-    /// `<base>` (the parent of `root`), for shared accounting and the root-wide sweep.
+    /// `<base>` (the parent of `root`), for the root-wide sweep. Null when the dupe failed.
     base_dir: ?[]u8 = null,
     entries: std.ArrayList(IndexEntry),
     next_id: u64,
@@ -503,8 +502,6 @@ pub const DiskTier = struct {
         context: ?module_record.Context,
     ) !DiskTier {
         if (base_dir.len == 0 or !std.fs.path.isAbsolute(base_dir)) return error.BadDiskCacheDir;
-        const owned_base = try allocator.dupe(u8, base_dir);
-        errdefer allocator.free(owned_base);
         const root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fingerprint });
         errdefer allocator.free(root);
         try std.Io.Dir.cwd().createDirPath(io, root);
@@ -514,7 +511,6 @@ pub const DiskTier = struct {
             .root = root,
             .max_bytes = max_bytes,
             .operator_cap = max_bytes,
-            .base_dir = owned_base,
             .chunk_tokens = if (chunk_tokens == 0) DEFAULT_CHUNK_TOKENS else chunk_tokens,
             .entries = std.ArrayList(IndexEntry).empty,
             .next_id = 1,
@@ -525,8 +521,8 @@ pub const DiskTier = struct {
         self.scan() catch |err| {
             log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
         };
-        self.refreshSharedBudget(max_bytes);
         self.gcToBudget();
+        self.base_dir = allocator.dupe(u8, base_dir) catch null;
         return self;
     }
 
@@ -1274,18 +1270,13 @@ pub const DiskTier = struct {
     /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a budget
     /// under the store floor declines new stores without touching what is already persisted.
     fn refreshDiskBudget(self: *DiskTier) void {
-        const vs = self.space_probe(self.root) orelse {
-            self.refreshSharedBudget(self.operator_cap);
-            return;
-        };
+        const vs = self.space_probe(self.root) orelse return;
         // Our own entries are already counted in `used`; add what the tier holds back.
         const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.physicalDiskBytes(), vs.total);
         if (budget) |b| {
-            self.refreshSharedBudget(self.operator_cap);
-            if (self.store_declined) return;
-            const available = if (self.max_bytes == 0) b else @min(self.max_bytes, b);
-            if (available != self.max_bytes) {
-                self.max_bytes = available;
+            self.store_declined = false;
+            if (b != self.max_bytes) {
+                self.max_bytes = b;
                 self.gcToBudget();
             }
         } else if (!self.store_declined) {
@@ -1300,46 +1291,13 @@ pub const DiskTier = struct {
         }
     }
 
-    /// A finite cap belongs to the common root, not independently to each model or engine.
-    fn refreshSharedBudget(self: *DiskTier, cap: u64) void {
-        const budget: ?u64 = if (cap == 0) 0 else blk: {
-            const base = self.base_dir orelse {
-                self.store_declined = true;
-                return;
-            };
-            break :blk disk_budget.availableBudget(self.allocator, self.io, base, self.root, cap, 0) catch |err| {
-                log.warn("[disk-cache] shared budget scan failed for {s}: {s}; new stores declined\n", .{ base, @errorName(err) });
-                self.store_declined = true;
-                return;
-            };
-        };
-        const available = budget orelse {
-            if (!self.store_declined) log.info("[disk-cache] {s}: other cache roots exhaust the shared disk budget; new stores declined\n", .{self.root});
-            self.store_declined = true;
-            return;
-        };
-        self.store_declined = false;
-        if (available != self.max_bytes) {
-            self.max_bytes = available;
-            self.gcToBudget();
-        }
-    }
-
     /// Sweep other models' fingerprints under the same base: strays always, LRU once they
     /// collectively exceed one budget's worth. SSD-first only.
     pub fn sweepSiblings(self: *DiskTier) void {
         if (!self.ssd_first) return;
         const base = self.base_dir orelse return;
         self.refreshDiskBudget();
-        const physical = disk_budget.physicalBytes(self.allocator, self.io, base, null) catch return;
-        const cap = if (self.space_probe(self.root)) |vs|
-            diskBudgetFromFreeSpace(self.operator_cap, vs.free +| physical, vs.total) orelse return
-        else if (self.operator_cap > 0)
-            self.operator_cap
-        else
-            return;
-        sweepBase(self.allocator, self.io, base, self.root, cap);
-        self.refreshDiskBudget();
+        sweepBase(self.allocator, self.io, base, self.root, self.max_bytes);
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -2050,7 +2008,7 @@ pub const DiskTier = struct {
         // Its eviction swap-removes, so the target crosses it by id; an evicted target is a fresh store.
         const extend_id: ?u64 = if (extend_idx) |i| self.entries.items[i].id else null;
         const ssm_only_id: ?u64 = if (ssm_only_idx) |i| self.entries.items[i].id else null;
-        if (self.ssd_first) self.refreshDiskBudget() else self.refreshSharedBudget(self.operator_cap);
+        if (self.ssd_first) self.refreshDiskBudget();
         // The refresh gates THIS store, not merely the next one.
         if (self.store_declined) return .skipped;
         extend_idx = if (extend_id) |x| self.indexOfId(x) else null;
@@ -2126,8 +2084,22 @@ pub const DiskTier = struct {
         // chunks this flush reaches is still written (position-keyed,
         // immutable) and becomes restorable when a later flush extends
         // kv_len past it.
-        const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
-        const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
+        //
+        // A fresh entry that hard-linked its leading chunks also links the donor's
+        // checkpoints at or below the shared prefix, so a fork into the inherited
+        // span keeps an anchor once the donor is evicted. Linked files bill 0.
+        var linked_ssm_pos = std.ArrayList(u32).empty;
+        defer linked_ssm_pos.deinit(self.allocator);
+        var linked_ssm_bytes = std.ArrayList(u64).empty;
+        defer linked_ssm_bytes.deinit(self.allocator);
+        if (donor) |d| if (inherited > 0) {
+            const de = &self.entries.items[d.idx];
+            const bound: u32 = @intCast(@min(@min(@min(commonPrefixLen(de.tokens, tokens), @as(usize, de.kv_len)), @as(usize, kv_target)), mediaSharedBound(de.media, media)));
+            self.linkInheritedSsm(d, id, bound, &linked_ssm_pos, &linked_ssm_bytes);
+        };
+        errdefer for (linked_ssm_pos.items) |p| self.deleteSsmFile(id, p);
+        const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else linked_ssm_pos.items;
+        const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else linked_ssm_bytes.items;
         var written_bytes: u64 = 0;
         var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
             // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
@@ -2198,7 +2170,11 @@ pub const DiskTier = struct {
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
         var non_chunk: u64 = @as(u64, record.len) * 4 + spec_res.bytes;
-        for (ssm_res.bytes) |b| non_chunk += b;
+        for (ssm_res.positions, ssm_res.bytes) |p, b| {
+            // A checkpoint linked from the donor (fresh entry only) bills 0, like an inherited chunk.
+            if (extend_idx == null and std.mem.indexOfScalar(u32, linked_ssm_pos.items, p) != null) continue;
+            non_chunk += b;
+        }
         if (!qsa_res.inherited) non_chunk += qsa_res.bytes;
         var bytes: u64 = non_chunk;
         for (chunk_sizes.items[@min(inherited, chunk_sizes.items.len)..]) |b| bytes += b;
@@ -2236,6 +2212,7 @@ pub const DiskTier = struct {
             var delta: i64 = @as(i64, @intCast(non_chunk)) - @as(i64, @intCast(nonChunkBytes(e)));
             for (new_entry.chunk_bytes[@min(keep, new_entry.chunk_bytes.len)..]) |b| delta += @as(i64, @intCast(b));
             if (e.chunk_bytes.len > keep) delta -= @as(i64, @intCast(e.chunk_bytes[keep]));
+            delta += @as(i64, @intCast(ssm_res.still_linked));
             new_entry.bytes = clampAdd(e.bytes, delta);
             // meta.json is the commit point: written last, atomically.
             try self.writeMeta(new_entry);
@@ -2367,6 +2344,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.ssm_bytes);
         e.ssm_positions = ssm_res.positions;
         e.ssm_bytes = ssm_res.bytes;
+        const still_linked = ssm_res.still_linked;
         // The arrays are the entry's from here: disarm the errdefer, or a failed
         // writeMeta frees what the entry owns and the next removal double-frees.
         ssm_res.positions = &.{};
@@ -2378,7 +2356,7 @@ pub const DiskTier = struct {
             e.qsa_history_rows = qsa_res.rows;
             e.inherited_qsa = false;
         }
-        const delta: i64 = @as(i64, @intCast(nonChunkBytes(e))) - @as(i64, @intCast(old_non_chunk));
+        const delta: i64 = @as(i64, @intCast(nonChunkBytes(e))) - @as(i64, @intCast(old_non_chunk)) + @as(i64, @intCast(still_linked));
         e.bytes = clampAdd(e.bytes, delta);
         self.total_bytes = clampAdd(self.total_bytes, delta);
         e.last_used = self.bump();
@@ -2898,6 +2876,10 @@ pub const DiskTier = struct {
         /// All target checkpoints made it to disk this flush (false → the
         /// per-flush byte cap deferred some; the caller keeps the entry dirty).
         complete: bool,
+        /// Bytes of retention-dropped files another entry still hard-links (a
+        /// chunk-share heir or donor): the volume did not get them back, so a
+        /// delta-billed caller must not drop them from `total_bytes`.
+        still_linked: u64 = 0,
 
         fn deinit(self: *SsmPersistResult, allocator: std.mem.Allocator) void {
             allocator.free(self.positions);
@@ -2988,8 +2970,11 @@ pub const DiskTier = struct {
         defer self.allocator.free(target);
 
         // Delete positions retention drops (present on disk, absent from target).
-        for (old_positions) |p| {
-            if (std.mem.indexOfScalar(u32, target, p) == null) self.deleteSsmFile(id, p);
+        var still_linked: u64 = 0;
+        for (old_positions, old_bytes) |p, b| {
+            if (std.mem.indexOfScalar(u32, target, p) != null) continue;
+            if (self.ssmFileShared(id, p)) still_linked += b;
+            self.deleteSsmFile(id, p);
         }
 
         const Pair = struct { pos: u32, bytes: u64 };
@@ -3033,7 +3018,40 @@ pub const DiskTier = struct {
             positions[i] = pr.pos;
             bytes[i] = pr.bytes;
         }
-        return .{ .positions = positions, .bytes = bytes, .complete = complete };
+        return .{ .positions = positions, .bytes = bytes, .complete = complete, .still_linked = still_linked };
+    }
+
+    /// `<root>/e<id>/s<pos>.safetensors`, owned by the caller; null when out of memory.
+    fn ssmPath(self: *DiskTier, id: u64, pos: u64) ?[]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch null;
+    }
+
+    /// What deleting the file at `path` (taken) returns to the volume: its size when no other entry
+    /// links it, else 0; `missing` when it cannot be named or stat'ed.
+    fn freedBytes(self: *DiskTier, path: ?[]u8, missing: u64) u64 {
+        const p = path orelse return missing;
+        defer self.allocator.free(p);
+        const st = statFile(self.io, p) orelse return missing;
+        return if (st.nlink <= 1) st.size else 0;
+    }
+
+    /// The scan's bill for the file at `path` (taken): a linked inode is paid by the first entry
+    /// that sees it; `missing` when it cannot be named or stat'ed.
+    fn billedOnce(self: *DiskTier, path: ?[]u8, missing: u64, seen: *std.AutoHashMap(u64, void)) u64 {
+        const p = path orelse return missing;
+        defer self.allocator.free(p);
+        const st = statFile(self.io, p) orelse return missing;
+        if (st.nlink <= 1) return st.size;
+        const gop = seen.getOrPut(@intCast(st.inode)) catch return st.size;
+        return if (gop.found_existing) 0 else st.size;
+    }
+
+    /// Is `e<id>/s<pos>` a hard link another entry also holds?
+    fn ssmFileShared(self: *DiskTier, id: u64, pos: u32) bool {
+        const path = self.ssmPath(id, pos) orelse return false;
+        defer self.allocator.free(path);
+        const st = statFile(self.io, path) orelse return false;
+        return st.nlink > 1;
     }
 
     /// Write (or, under SSD-first, stage) one SSM checkpoint as `s{pos:0>7}.safetensors`.
@@ -3347,7 +3365,7 @@ pub const DiskTier = struct {
     }
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
-        const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
+        const path = self.ssmPath(id, pos) orelse return;
         defer self.allocator.free(path);
         // A staged checkpoint may still be in the writer's queue; fence it before deleting, or
         // the write lands a file no index names.
@@ -3405,30 +3423,16 @@ pub const DiskTier = struct {
         defer self.allocator.free(dir_abs);
         if (self.writer) |w| w.fence(dir_abs);
         var freed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        for (e.ssm_bytes) |b| freed += b;
+        // Checkpoints, the QSA history and chunks may be hard links a chunk-share heir or donor
+        // also holds: only the last link returns its bytes.
+        for (e.ssm_positions, e.ssm_bytes) |pos, b| freed += self.freedBytes(self.ssmPath(e.id, pos), b);
         if (e.qsa_history_bytes > 0) {
-            if (std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs})) |qp| {
-                defer self.allocator.free(qp);
-                if (statFile(self.io, qp)) |st| {
-                    if (st.nlink <= 1) freed += st.size;
-                } else if (!e.inherited_qsa) {
-                    freed += e.qsa_history_bytes;
-                }
-            } else |_| {
-                if (!e.inherited_qsa) freed += e.qsa_history_bytes;
-            }
+            const qp = std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs}) catch null;
+            freed += self.freedBytes(qp, if (e.inherited_qsa) 0 else e.qsa_history_bytes);
         }
         for (e.chunk_bytes, 0..) |cb, i| {
-            const cp = std.fmt.allocPrint(self.allocator, "{s}c{d:0>6}.safetensors", .{ dir_abs, i }) catch {
-                freed += cb;
-                continue;
-            };
-            defer self.allocator.free(cp);
-            if (statFile(self.io, cp)) |st| {
-                if (st.nlink <= 1) freed += st.size;
-            } else if (i >= e.inherited_chunks) {
-                freed += cb;
-            }
+            const cp = std.fmt.allocPrint(self.allocator, "{s}c{d:0>6}.safetensors", .{ dir_abs, i }) catch null;
+            freed += self.freedBytes(cp, if (i >= e.inherited_chunks) cb else 0);
         }
         return freed;
     }
@@ -3490,6 +3494,41 @@ pub const DiskTier = struct {
         mb /= 1024.0 * 1024.0;
         log.info("  [disk-cache] chunk share: e{d} inherits {d} chunks ({d:.1} MB) from e{d} by hard link\n", .{ id, linked, mb, d.id });
         return linked;
+    }
+
+    /// Best-effort hard link of the donor's landed SSM checkpoints at positions in (0, `bound`] into
+    /// `e<id>/`, appending each position and the donor's recorded size to the out lists. A checkpoint
+    /// at `p` depends only on `tokens[0..p)`, so any one at or below the common prefix is valid here.
+    fn linkInheritedSsm(self: *DiskTier, d: ChunkDonor, id: u64, bound: u32, pos_out: *std.ArrayList(u32), bytes_out: *std.ArrayList(u64)) void {
+        if (bound == 0) return;
+        var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{}) catch return;
+        defer root_dir.close(self.io);
+        const de = &self.entries.items[d.idx];
+        var ob: [64]u8 = undefined;
+        var nb: [64]u8 = undefined;
+        for (de.ssm_positions, de.ssm_bytes) |p, sz| {
+            if (p == 0 or p > bound) continue;
+            const old_abs = self.ssmPath(d.id, p) orelse continue;
+            defer self.allocator.free(old_abs);
+            if (!self.chunkLanded(old_abs, sz)) continue; // still staged in the writer: skip it
+            const old_sub = std.fmt.bufPrint(&ob, "e{d}/s{d:0>7}.safetensors", .{ d.id, p }) catch continue;
+            const new_sub = std.fmt.bufPrint(&nb, "e{d}/s{d:0>7}.safetensors", .{ id, p }) catch continue;
+            std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
+                log.warn("  [disk-cache] ssm share: link e{d}/s{d} -> e{d} failed: {s}\n", .{ d.id, p, id, @errorName(err) });
+                continue;
+            };
+            pos_out.append(self.allocator, p) catch {
+                self.deleteSsmFile(id, p);
+                break;
+            };
+            bytes_out.append(self.allocator, sz) catch {
+                _ = pos_out.pop();
+                self.deleteSsmFile(id, p);
+                break;
+            };
+        }
+        if (pos_out.items.len > 0)
+            log.info("  [disk-cache] ssm share: e{d} inherits {d} checkpoints (<= {d}) from e{d} by hard link\n", .{ id, pos_out.items.len, bound, d.id });
     }
 
     fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
@@ -3732,48 +3771,14 @@ pub const DiskTier = struct {
             return;
         }
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        for (e.ssm_bytes) |b| billed += b;
+        for (e.ssm_positions, e.ssm_bytes) |pos, b| billed += self.billedOnce(self.ssmPath(e.id, pos), b, seen);
         if (e.qsa_history_bytes > 0) {
-            if (std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id })) |qp| {
-                defer self.allocator.free(qp);
-                if (statFile(self.io, qp)) |st| {
-                    if (st.nlink <= 1) {
-                        billed += st.size;
-                    } else {
-                        const ino: u64 = @intCast(st.inode);
-                        if (seen.getOrPut(ino)) |gop| {
-                            if (!gop.found_existing) billed += st.size;
-                        } else |_| {
-                            billed += st.size;
-                        }
-                    }
-                } else if (!e.inherited_qsa) {
-                    billed += e.qsa_history_bytes;
-                }
-            } else |_| {
-                if (!e.inherited_qsa) billed += e.qsa_history_bytes;
-            }
+            const qp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id }) catch null;
+            billed += self.billedOnce(qp, if (e.inherited_qsa) 0 else e.qsa_history_bytes, seen);
         }
         for (e.chunk_bytes, 0..) |cb, i| {
-            const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, i }) catch {
-                billed += cb;
-                continue;
-            };
-            defer self.allocator.free(cp);
-            const st = statFile(self.io, cp) orelse {
-                billed += cb;
-                continue;
-            };
-            if (st.nlink <= 1) {
-                billed += st.size;
-                continue;
-            }
-            const ino: u64 = @intCast(st.inode);
-            const gop = seen.getOrPut(ino) catch {
-                billed += st.size;
-                continue;
-            };
-            if (!gop.found_existing) billed += st.size;
+            const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, i }) catch null;
+            billed += self.billedOnce(cp, cb, seen);
         }
         e.bytes = billed;
     }
@@ -3940,7 +3945,7 @@ pub const DiskTier = struct {
                     const pos = jsonU64(o, "pos") orelse continue;
                     const szrec = jsonU64(o, "bytes") orelse continue;
                     if (pos == 0 or pos > kv_len) continue; // beyond the salvaged KV → unusable
-                    const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
+                    const sp = self.ssmPath(id, pos) orelse continue;
                     defer self.allocator.free(sp);
                     const have = fileSize(self.io, sp) orelse continue;
                     if (have != szrec) continue; // truncated mid-flush — drop this position
@@ -4114,32 +4119,30 @@ pub const DiskTier = struct {
 /// the stale KV (GC'd by the disk budget eventually; different fingerprint
 /// dirs never mix). 16 hex chars of XxHash64.
 /// Root-wide LRU sweep across sibling model fingerprints (never `keep_root`, which the tier's
-/// own `scan` owns), oldest first until the whole root fits `global_budget`, plus index-less strays that
+/// own `scan` owns), oldest first until they fit `sibling_budget`, plus index-less strays that
 /// are old enough to be crash leftovers. Best effort.
 pub fn sweepBase(
     allocator: std.mem.Allocator,
     io: std.Io,
     base_dir: []const u8,
     keep_root: []const u8,
-    global_budget: u64,
+    sibling_budget: u64,
 ) void {
     var base = std.Io.Dir.openDirAbsolute(io, base_dir, .{ .iterate = true }) catch return;
     defer base.close(io);
 
-    const Victim = struct { path: []u8, mtime: i128 };
+    const Victim = struct { path: []u8, bytes: u64, mtime: i128 };
     var victims = std.ArrayList(Victim).empty;
     defer {
         for (victims.items) |v| allocator.free(v.path);
         victims.deinit(allocator);
     }
+    var total: u64 = 0;
     var strays: usize = 0;
 
     var fps = base.iterate();
     while (fps.next(io) catch null) |fp| {
         if (fp.kind != .directory) continue;
-        // Only modelFingerprintWithLayout's XxHash64 roots belong to this format's eviction.
-        if (fp.name.len != 2 * @sizeOf(u64)) continue;
-        _ = std.fmt.parseUnsigned(u64, fp.name, 16) catch continue;
         const fp_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fp.name }) catch continue;
         defer allocator.free(fp_abs);
         if (std.mem.eql(u8, fp_abs, keep_root)) continue; // the live tier owns its own
@@ -4170,33 +4173,33 @@ pub fn sweepBase(
             };
             // A `.tmp` older than the same bar is a crash leftover of the writer's tmp+rename.
             reapStaleTmp(io, e_abs);
-            victims.append(allocator, .{ .path = e_abs, .mtime = st.mtime.nanoseconds }) catch {
+            const bytes = dirBytes(io, e_abs);
+            total += bytes;
+            victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime.nanoseconds }) catch {
                 allocator.free(e_abs);
             };
         }
     }
 
     if (strays > 0) log.info("  [disk-cache] swept {d} stray entry directories under {s}\n", .{ strays, base_dir });
-    const total = disk_budget.physicalBytes(allocator, io, base_dir, null) catch return;
-    if (total <= global_budget) return;
+    if (total <= sibling_budget) return;
 
     std.mem.sort(Victim, victims.items, {}, struct {
         fn lt(_: void, a: Victim, b: Victim) bool {
             return a.mtime < b.mtime;
         }
     }.lt);
-    var remaining = total;
+    var freed: u64 = 0;
     for (victims.items) |v| {
-        if (remaining <= global_budget) break;
+        if (total -| freed <= sibling_budget) break;
         deleteTreeAbsolute(io, v.path);
-        remaining = disk_budget.physicalBytes(allocator, io, base_dir, null) catch return;
+        freed += v.bytes;
     }
-    const freed = total -| remaining;
     if (freed > 0) {
         log.info("  [disk-cache] root-wide LRU freed {d} MB across other models ({d} MB held, {d} MB budget)\n", .{
             freed >> 20,
             total >> 20,
-            global_budget >> 20,
+            sibling_budget >> 20,
         });
     }
 }
@@ -7327,76 +7330,6 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     try testing.expectEqual(@as(u32, 768), tier.entries.items[0].kv_len);
 }
 
-test "shared disk budget MLX init and refresh subtract native files and never interpret exhaustion as unlimited" {
-    const io = testing.io;
-    const GB: u64 = 1 << 30;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "ds4/model");
-    const native = try tmp.dir.createFile(io, "ds4/model/state.kv", .{});
-    defer native.close(io);
-    try native.setLength(io, 6 * GB);
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.init(testing.allocator, io, base, "0000000000000001", 8 * GB, 128);
-    defer tier.deinit();
-    try testing.expectEqual(@as(u64, 2 * GB), tier.max_bytes);
-    try testing.expect(!tier.store_declined);
-    tier.ssd_first = true;
-    tier.armTestSpace(1024 * GB, 2048 * GB);
-    tier.refreshDiskBudget();
-    try testing.expectEqual(@as(u64, 2 * GB), tier.max_bytes);
-    // Free space already excludes native files: the volume constraint must not charge them twice.
-    tier.armTestSpace(12 * GB, 100 * GB);
-    tier.refreshDiskBudget();
-    try testing.expect(!tier.store_declined);
-    try testing.expectEqual(@as(u64, 2 * GB), tier.max_bytes);
-    tier.armTestSpace(1024 * GB, 2048 * GB);
-    try native.setLength(io, 8 * GB);
-    tier.refreshDiskBudget();
-    try testing.expect(tier.store_declined);
-    try testing.expect(tier.max_bytes != 0);
-    // Decline occurs before any persistence work, including on a RAM-first store.
-    tier.ssd_first = false;
-    const tokens: [MIN_PERSIST_TOKENS]u32 = @splat(7);
-    try testing.expectEqual(PersistOutcome.skipped, try tier.appendCommit(&.{}, tokens.len, kv_quant.KVQuantConfig.dense, &tokens, false, null, mlx.gpuStream()));
-    try testing.expectEqual(@as(usize, 0), tier.entryCount());
-    try testing.expectEqual(@as(u64, 8 * GB), (try tmp.dir.statFile(io, "ds4/model/state.kv", .{})).size);
-    try native.setLength(io, 7 * GB);
-    tier.refreshDiskBudget();
-    try testing.expect(!tier.store_declined);
-    try testing.expectEqual(@as(u64, GB), tier.max_bytes);
-    tier.refreshDiskBudget();
-    try testing.expectEqual(@as(u64, GB), tier.max_bytes);
-}
-
-test "shared disk budget root LRU charges live MLX and native data but only removes MLX fingerprints" {
-    const a = testing.allocator;
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "0000000000000002/e1");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000002/e1/meta.json", .data = "" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000002/e1/chunk", .data = &@as([30]u8, @splat(1)) });
-    try tmp.dir.createDirPath(io, "ds4/e999");
-    try tmp.dir.writeFile(io, .{ .sub_path = "ds4/e999/save.tmp", .data = &@as([60]u8, @splat(2)) });
-    const aged: std.Io.Timestamp = .{ .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds - 2 * @as(i96, @intCast(STRAY_MIN_AGE_NS)) };
-    try tmp.dir.setTimestamps(io, "ds4/e999/save.tmp", .{ .modify_timestamp = .{ .new = aged } });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var live = try DiskTier.init(a, io, base, "0000000000000001", 0, 128);
-    defer live.deinit();
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000001/held", .data = &@as([20]u8, @splat(3)) });
-    // Nothing is evicted while all engines together fit the cap.
-    sweepBase(a, io, base, live.root, 110);
-    try testing.expect((try tmp.dir.statFile(io, "0000000000000002/e1/chunk", .{})).size == 30);
-    sweepBase(a, io, base, live.root, 100);
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "0000000000000002/e1/chunk", .{}));
-    try testing.expectEqual(@as(u64, 60), (try tmp.dir.statFile(io, "ds4/e999/save.tmp", .{})).size);
-    try testing.expectEqual(@as(u64, 20), (try tmp.dir.statFile(io, "0000000000000001/held", .{})).size);
-    try testing.expectEqual(@as(u64, 80), try disk_budget.physicalBytes(a, io, base, null));
-}
-
 test "diskBudgetFromFreeSpace: reserve is min(64 GiB, 10% of volume); below the floor stores nothing" {
     const GB: u64 = 1 << 30;
     // 4 TB volume, 1 TB free: reserve is the 64 GiB cap.
@@ -7682,7 +7615,7 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     const base = try tmpRoot(&tmp, io, &buf);
 
     {
-        var sib = try DiskTier.init(testing.allocator, io, base, "0000000000000001", 0, 128);
+        var sib = try DiskTier.init(testing.allocator, io, base, "fp-sibling", 0, 128);
         defer sib.deinit();
         var cache = try KVCache.init(testing.allocator, 1);
         defer cache.deinit();
@@ -7691,36 +7624,36 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
         for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
         _ = try sib.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     }
-    try tmp.dir.createDirPath(io, "0000000000000002/e9");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000002/e9/c000000.safetensors", .data = "orphan" });
+    try tmp.dir.createDirPath(io, "fp-stray/e9");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stray/e9/c000000.safetensors", .data = "orphan" });
     const aged: std.Io.Timestamp = .{
         .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds - 2 * @as(i96, @intCast(STRAY_MIN_AGE_NS)),
     };
-    try tmp.dir.setTimestamps(io, "0000000000000002/e9/c000000.safetensors", .{ .modify_timestamp = .{ .new = aged } });
+    try tmp.dir.setTimestamps(io, "fp-stray/e9/c000000.safetensors", .{ .modify_timestamp = .{ .new = aged } });
     // Its young twin: index-less but written just now, so it must survive.
-    try tmp.dir.createDirPath(io, "0000000000000003/e3");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000003/e3/c000000.safetensors", .data = "another server" });
-    var live = try DiskTier.init(testing.allocator, io, base, "0000000000000004", 0, 128);
+    try tmp.dir.createDirPath(io, "fp-inflight/e3");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-inflight/e3/c000000.safetensors", .data = "another server" });
+    var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
     defer live.deinit();
     live.ssd_first = true;
     live.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     // The live tier's own root, mid-write-through: chunks, no index yet. Staged after init
     // (init's own `scan` rightly drops an index-less entry).
-    try tmp.dir.createDirPath(io, "0000000000000004/e1");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000004/e1/c000000.safetensors", .data = "inflight" });
+    try tmp.dir.createDirPath(io, "fp-live/e1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-live/e1/c000000.safetensors", .data = "inflight" });
     live.max_bytes = 1 << 40;
     sweepBase(testing.allocator, io, base, live.root, live.max_bytes);
 
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "0000000000000002/e9/c000000.safetensors", .{}));
-    try testing.expect(tmp.dir.statFile(io, "0000000000000003/e3/c000000.safetensors", .{}) catch null != null);
-    try testing.expect(tmp.dir.statFile(io, "0000000000000001/e1/meta.json", .{}) catch null != null);
-    try testing.expect(tmp.dir.statFile(io, "0000000000000004/e1/c000000.safetensors", .{}) catch null != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stray/e9/c000000.safetensors", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
 
     // With a budget of zero the siblings' real entries go too, and the live root is still untouched.
     sweepBase(testing.allocator, io, base, live.root, 0);
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "0000000000000001/e1/meta.json", .{}));
-    try testing.expect(tmp.dir.statFile(io, "0000000000000004/e1/c000000.safetensors", .{}) catch null != null);
-    try testing.expect(tmp.dir.statFile(io, "0000000000000003/e3/c000000.safetensors", .{}) catch null != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
 }
 
 test "DiskTier: SSM retention spacing is priced against the tier, not just capped" {
@@ -9939,4 +9872,121 @@ test "failure attribution overflow retires all unfinished module exports once" {
     try testing.expectEqual(@as(u64, 2), tier.module_export_losses_total);
     _ = tier.harvestWriteFailures();
     try testing.expectEqual(@as(u64, 2), tier.module_export_losses_total);
+}
+
+test "DiskTier chunk share: an heir hard-links the donor's checkpoints below the shared prefix and keeps them after the donor dies" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssm-share", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520); // 4 whole chunks shared; the fork is at 520
+
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 590, s), // above the fork: never linked
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, &cps, s);
+    const donor_id = tier.entries.items[0].id;
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 512, 590 }, tier.entries.items[0].ssm_positions);
+
+    // The heir's own prefill captured nothing (cps = null): every checkpoint it holds is linked.
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const heir = &tier.entries.items[1];
+    const heir_id = heir.id;
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 512 }, heir.ssm_positions);
+    // One inode, two links; the links bill 0, like inherited chunks.
+    var pbuf: [1024]u8 = undefined;
+    var hbuf: [1024]u8 = undefined;
+    const dp = try std.fmt.bufPrint(&pbuf, "{s}/fp-ssm-share/e{d}/s{d:0>7}.safetensors", .{ base, donor_id, 512 });
+    const hp = try std.fmt.bufPrint(&hbuf, "{s}/fp-ssm-share/e{d}/s{d:0>7}.safetensors", .{ base, heir_id, 512 });
+    try testing.expectEqual(statFile(io, dp).?.inode, statFile(io, hp).?.inode);
+    try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(statFile(io, hp).?.nlink)));
+    try testing.expectEqual(heir.chunk_bytes[4] + 600 * 4, heir.bytes);
+
+    // A fresh scan re-validates the linked sizes and bills each inode once.
+    {
+        var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssm-share", 0, 128);
+        defer tier2.deinit();
+        try testing.expectEqual(tier.total_bytes, tier2.total_bytes);
+    }
+
+    // The donor dies (byte-budget LRU): the heir still restores at 512 for a fork at 520.
+    const before = tier.total_bytes;
+    tier.removeAt(0);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(?u32, 512), tier.highestSsmPosAtOrBelow(0, 520));
+    // The linked checkpoint files stayed on disk, so removing the donor did not return their bytes.
+    try testing.expect(statFile(io, hp) != null);
+    try testing.expect(tier.total_bytes < before);
+}
+
+test "DiskTier chunk share: thinning a checkpoint the donor still links keeps the bill (a fresh scan agrees)" {
+    // Retention drops a linked file from the heir while the donor still holds the inode: the volume gets nothing back.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssm-thin", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, &cps, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 512 }, tier.entries.items[1].ssm_positions);
+
+    // The heir's next checkpoint pushes both linked ones out (cap 1).
+    tier.ssm_max_per_entry = 1;
+    var top = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 560, s)};
+    defer top[0].deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, &top, s);
+    try testing.expectEqual(@as(usize, 1), tier.entries.items[1].ssm_positions.len);
+    {
+        var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssm-thin", 0, 128);
+        defer tier2.deinit();
+        try testing.expectEqual(tier2.total_bytes, tier.total_bytes);
+    }
+    // The donor dies: its checkpoints are now its own last links, and the bill still matches the files.
+    tier.removeAt(0);
+    {
+        var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-ssm-thin", 0, 128);
+        defer tier3.deinit();
+        try testing.expectEqual(tier3.total_bytes, tier.total_bytes);
+    }
 }

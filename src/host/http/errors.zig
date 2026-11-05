@@ -6,6 +6,7 @@ const log = @import("../../sdk/util/log.zig");
 const Scheduler = @import("../gpu_thread/scheduler.zig").Scheduler;
 const Stream = @import("../engines/stream.zig").Stream;
 const mlx_engine = @import("../engines/mlx.zig");
+const plugin_loader = @import("../plugins/loader.zig");
 const err_name = @import("../../sdk/util/err_name.zig");
 const instr = @import("../metrics/metrics.zig");
 const testing = std.testing;
@@ -347,7 +348,7 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         error.DistWorkerNotJoined => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "worker_not_joined", "This model is served with a second Mac that has not joined: start `mlx-serve worker` there, then retry", 503),
         error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
         error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
-        error.Ds4EngineBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another GGUF model holds the ds4 engine and is serving a request; retry when it finishes", 503),
+        error.Ds4EngineBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another GGUF model is using the ds4 engine; retry when it is idle", 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
         // config.json, etc.) bubble out of `preloadCpuState`. Surface a
@@ -373,7 +374,9 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
 fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *Scheduler, id: []const u8) !void {
     if (mlx_engine.api().load_error_name(sched, allocator, id)) |name| {
         defer allocator.free(name);
-        if (std.fmt.allocPrint(allocator, "Model load failed: {s}", .{name}) catch null) |msg| {
+        const hint = plugin_loader.rebuildHint(allocator, plugin_loader.process.get().set.refused.items) catch null;
+        defer if (hint) |h| allocator.free(h);
+        if (std.fmt.allocPrint(allocator, "Model load failed: {s}{s}{s}", .{ name, if (hint != null) ". " else "", hint orelse "" }) catch null) |msg| {
             defer allocator.free(msg);
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
             return;

@@ -32,6 +32,7 @@ const drafter_mod = @import("plugins/gemma4/assistant_drafter.zig");
 const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
+const ablation_api = @import("host/api/ablation.zig");
 const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
@@ -357,6 +358,9 @@ fn printUsage(io: std.Io) void {
         \\                        off (default), 4, 8     — affine group quant.
         \\                          Per-request override via the `kv_quant`
         \\                          body field.
+        \\  --ablation-profiles <dir> --ablation-key-file <path>
+        \\                      Per-request directional ablation (docs/api.md);
+        \\                        the key file is 0600, at least 32 bytes.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -392,6 +396,8 @@ fn printUsage(io: std.Io) void {
         \\                      Pass 0/off to disable the byte budget.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
         \\                      SSD tier for the prefix cache (default: off).
+        \\                      Budget per MLX model tier and ds4 pool,
+        \\                        not a shared total.
         \\                      Seen prefixes persist under ~/.mlx-serve/kv-cache
         \\                        and are restored across restarts and RAM
         \\                        evictions instead of recomputed. Can use many
@@ -559,6 +565,7 @@ pub fn main(init: std.process.Init) !void {
     // `runHeadlessServe` (the mode the app always launches) silently ate the
     // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
+    mlx.exportResidencyRefresh();
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
     mlx.exportCudaHome();
@@ -714,6 +721,8 @@ pub fn main(init: std.process.Init) !void {
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
     // Off by default — only the `.affine` cache scheme has a fused path.
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
+    var ablation_profiles: ?[]const u8 = null;
+    var ablation_key_file: ?[]const u8 = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -1179,6 +1188,12 @@ pub fn main(init: std.process.Init) !void {
             ds4_ssd_streaming = true;
         } else if (std.mem.eql(u8, args[i], "--no-ds4-mtp")) {
             ds4_mtp = false;
+        } else if (std.mem.eql(u8, args[i], "--ablation-profiles") and i + 1 < args.len) {
+            i += 1;
+            ablation_profiles = args[i];
+        } else if (std.mem.eql(u8, args[i], "--ablation-key-file") and i + 1 < args.len) {
+            i += 1;
+            ablation_key_file = args[i];
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1439,6 +1454,7 @@ pub fn main(init: std.process.Init) !void {
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
     log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
+    server_mod.g_ablation = ablation_api.launch(allocator, io, ablation_profiles, ablation_key_file) catch std.process.exit(1);
 
     // Set GPU as default
     var metal_avail: bool = false;
@@ -1468,7 +1484,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @backingInt(mode), group_model, dist_split));
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split));
     }
 
     if (serve_mode) {
@@ -1674,7 +1690,6 @@ pub fn main(init: std.process.Init) !void {
             .llama = server_mod.llama_settings,
             .ds4_mtp = ds4_mtp,
             .ds4_dspark = ds4_dspark,
-            .ds4_ssd_streaming = ds4_ssd_streaming,
             .metrics = server_mod.g_metrics,
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
@@ -1819,7 +1834,6 @@ fn runGenServe(
         .tokenize_cache_entries = 0,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
-        .ds4_ssd_streaming = ds4_ssd_streaming,
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
@@ -1968,7 +1982,6 @@ fn runHeadlessServe(
         // --no-ds4-mtp / --dspark for every embedded-engine load.
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
-        .ds4_ssd_streaming = ds4_ssd_streaming,
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
