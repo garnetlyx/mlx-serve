@@ -33,6 +33,7 @@ pub const Error = error{
     SessionSpecFailed,
     SnapshotFailed,
     LoadSnapshotFailed,
+    VisionEncodeFailed,
     KernelExtractionFailed,
     OutOfMemory,
 };
@@ -245,7 +246,14 @@ pub const OpenOptions = struct {
     /// Graph prefill chunk (`--prefill-chunk`); 0 = ds4's default. Its scratch
     /// scales with it, so a small GPU needs a small chunk to stream experts.
     prefill_chunk: u32 = 0,
+    /// The checkpoint's vision projector GGUF (an `mmproj-*.gguf` beside it): images become prompt rows.
+    vision_path: ?[]const u8 = null,
 };
+
+/// One image's rows from the vision tower; free with `Ds4Engine.freeEmbedding`.
+pub const Embedding = ffi.VisionEmbedding;
+/// An image's rows and where its placeholder run starts in the prompt.
+pub const Span = ffi.VisionSpan;
 
 /// What the GGUF header lets ds4 draft from (`gguf_meta.ds4Spec`); the callers
 /// ask only when `--mtp` is on.
@@ -293,6 +301,7 @@ pub const Ds4Engine = struct {
     handle: *ffi.Engine,
     model_path_owned: [:0]u8,
     mtp_path_owned: ?[:0]u8,
+    vision_path_owned: ?[:0]u8,
     /// The in-checkpoint head is armed: speculation also serves SAMPLED
     /// requests (`ds4_session_eval_speculative`).
     embedded_mtp: bool,
@@ -306,6 +315,8 @@ pub const Ds4Engine = struct {
 
         const mtp_z: ?[:0]u8 = if (opts.mtp_path) |p| (allocator.dupeSentinel(u8, p, 0) catch return Error.OutOfMemory) else null;
         errdefer if (mtp_z) |s| allocator.free(s);
+        const vision_z: ?[:0]u8 = if (opts.vision_path) |p| (allocator.dupeSentinel(u8, p, 0) catch return Error.OutOfMemory) else null;
+        errdefer if (vision_z) |s| allocator.free(s);
 
         const dspark_on = dsparkEffective(opts.dspark, mtp_z != null);
         if (opts.dspark and !dspark_on) {
@@ -324,6 +335,7 @@ pub const Ds4Engine = struct {
             .glm_mtp = embedded_mtp,
             .model_path = path_z.ptr,
             .mtp_path = if (mtp_z) |s| s.ptr else null,
+            .vision_path = if (vision_z) |s| s.ptr else null,
             .backend = opts.backend,
             .n_threads = opts.n_threads,
             .mtp_draft_tokens = opts.mtp_draft_tokens,
@@ -360,6 +372,7 @@ pub const Ds4Engine = struct {
             .handle = raw.?,
             .model_path_owned = path_z,
             .mtp_path_owned = mtp_z,
+            .vision_path_owned = vision_z,
             .embedded_mtp = embedded_mtp,
         };
         return wrapper;
@@ -369,7 +382,27 @@ pub const Ds4Engine = struct {
         ffi.ds4_engine_close(self.handle);
         self.allocator.free(self.model_path_owned);
         if (self.mtp_path_owned) |s| self.allocator.free(s);
+        if (self.vision_path_owned) |s| self.allocator.free(s);
         self.allocator.destroy(self);
+    }
+
+    pub fn hasVision(self: *Ds4Engine) bool {
+        return ffi.ds4_engine_has_vision(self.handle);
+    }
+
+    /// Runs the vision tower over an encoded image (PNG or JPEG).
+    pub fn encodeImage(self: *Ds4Engine, encoded: []const u8) Error!Embedding {
+        var out: Embedding = .{};
+        var err_buf: [256]u8 = std.mem.zeroes([256]u8);
+        if (ffi.ds4_engine_vision_encode_memory(self.handle, encoded.ptr, encoded.len, &out, &err_buf, err_buf.len) == 0) {
+            log.err("[ds4] vision encode failed: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
+            return Error.VisionEncodeFailed;
+        }
+        return out;
+    }
+
+    pub fn freeEmbedding(embedding: *Embedding) void {
+        ffi.ds4_vision_embedding_free(embedding);
     }
 
     pub fn hasMtp(self: *Ds4Engine) bool {
@@ -586,6 +619,22 @@ pub const Ds4Session = struct {
         }
     }
 
+    /// `sync` for a prompt that carries images: `spans` covers every image in it, in order. ds4 borrows rows
+    /// during sync, copies their identities into the checkpoint, and releases the pointers before returning.
+    pub fn syncMultimodal(self: *Ds4Session, prompt_ids: []const i32, spans: []const Span, cancel: ?*std.atomic.Value(bool)) Error!void {
+        var holder = try TokenHolder.init(self.allocator, prompt_ids);
+        defer holder.deinit();
+        var err_buf: [256]u8 = std.mem.zeroes([256]u8);
+        ffi.ds4_session_set_cancel(self.handle, if (cancel != null) cancelRaised else null, cancel);
+        defer ffi.ds4_session_set_cancel(self.handle, null, null);
+        const rc = ffi.ds4_session_sync_multimodal(self.handle, &holder.tv, spans.ptr, spans.len, &err_buf, err_buf.len);
+        if (rc == ffi.session_sync_interrupted) return Error.SyncInterrupted;
+        if (rc != 0) {
+            log.err("[ds4] session_sync_multimodal rc={d} err={s}\n", .{ rc, std.mem.sliceTo(&err_buf, 0) });
+            return Error.SessionSyncFailed;
+        }
+    }
+
     fn cancelRaised(ud: ?*anyopaque) callconv(.c) bool {
         const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud.?));
         return flag.load(.acquire);
@@ -639,11 +688,42 @@ pub const Ds4Session = struct {
         eos_token: i32,
         out_tokens: []i32,
     ) Error!i32 {
+        return self.evalSpeculativeMode(first_token, max_tokens, eos_token, out_tokens, false);
+    }
+
+    pub fn evalSpeculativeIgnoringEos(
+        self: *Ds4Session,
+        first_token: i32,
+        max_tokens: i32,
+        eos_token: i32,
+        out_tokens: []i32,
+    ) Error!i32 {
+        return self.evalSpeculativeMode(first_token, max_tokens, eos_token, out_tokens, true);
+    }
+
+    fn evalSpeculativeMode(
+        self: *Ds4Session,
+        first_token: i32,
+        max_tokens: i32,
+        eos_token: i32,
+        out_tokens: []i32,
+        ignore_eos: bool,
+    ) Error!i32 {
         var c_out_buf = self.allocator.alloc(c_int, out_tokens.len) catch return Error.OutOfMemory;
         defer self.allocator.free(c_out_buf);
 
         var err_buf: [256]u8 = undefined;
-        const n = ffi.ds4_session_eval_speculative_argmax(
+        const n = if (ignore_eos) ffi.ds4_session_eval_speculative_argmax_ignoring_eos(
+            self.handle,
+            first_token,
+            max_tokens,
+            eos_token,
+            .high,
+            c_out_buf.ptr,
+            @intCast(c_out_buf.len),
+            &err_buf,
+            err_buf.len,
+        ) else ffi.ds4_session_eval_speculative_argmax(
             self.handle,
             @intCast(first_token),
             @intCast(max_tokens),
