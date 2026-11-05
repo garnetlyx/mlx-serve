@@ -81,7 +81,9 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             tokens: TokenTable,
             mapped_bytes: u64,
             template: []const u8,
-            /// Where the last reply began in the session: the length of the prompt it answered.
+            /// The last prompt as the client sent it, and where its reply began in the session (the length of the
+            /// prompt synced for it): `keptReply` continues a conversation whose copies of past replies differ.
+            client_prompt: []const i32 = &.{},
             reply_start: usize = 0,
             thread: std.Thread = undefined,
             startup_buf: [96]u8 = undefined,
@@ -217,6 +219,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             st.tokens.deinit(gpa);
             gpa.free(st.eos);
             gpa.free(st.template);
+            gpa.free(st.client_prompt);
             st.session.free();
             st.engine.close();
             gpa.destroy(st);
@@ -300,6 +303,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 const reason = serve(st, r) catch |err| {
                     // Leave nothing half-built behind for the next request.
                     st.session.invalidate();
+                    forgetPrompt(st);
                     st.book.done(r, .failed, @errorName(err));
                     continue;
                 };
@@ -307,32 +311,52 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             }
         }
 
-        /// How far before the last reply a client's copy of it may diverge: the reasoning opener of the generation
-        /// prompt, which a template renders differently in history.
+        /// How far before the end of its last prompt a client's copy of the reply may begin to differ: the reasoning
+        /// opener of the generation prompt, which a template renders differently in history.
         const reply_opener_tokens = 4;
+        /// A client's copy must close as the sampled reply did (a re-serialized tool call still ends `</tool_call>`);
+        /// a client that dropped the reply and wrote a turn of its own does not.
+        const reply_tail_tokens = 2;
 
         const Kept = struct { tokens: []i32, covered: usize };
 
-        /// A client's copy of the reply this session generated last can differ from what was sampled (reasoning left
-        /// out, a tool call re-serialized), and ds4 cannot rewind a hybrid model's state into it, so a plain sync
-        /// replays the whole prompt. When `prompt` leaves the live session inside that reply, keep the sampled reply
-        /// and prefill only what follows the client's copy, from its end-of-turn token on. Null: sync `prompt` as is.
+        /// A client's copy of a reply this session generated can differ from what was sampled (reasoning left out, a
+        /// tool call re-serialized), and ds4 cannot rewind a hybrid model's state into it, so a plain sync replays the
+        /// whole conversation. When `prompt` extends the client's last prompt with its copy of the reply, keep the
+        /// session (every sampled reply in it) and prefill only what follows the copy, from its end-of-turn token on.
+        /// Null: sync `prompt` as sent.
         fn keptReply(st: *State, prompt: []const i32, max_tokens: u32) !?Kept {
             if (st.reply_start == 0) return null;
+            const common = std.mem.indexOfDiff(i32, st.client_prompt, prompt) orelse return null;
+            if (common + reply_opener_tokens < st.client_prompt.len or common >= prompt.len) return null;
             const live = try st.session.liveTokens(gpa);
             defer gpa.free(live);
-            if (live.len <= st.reply_start) return null;
-            const common = std.mem.indexOfDiff(i32, live, prompt) orelse return null;
-            if (common >= live.len or common + reply_opener_tokens < st.reply_start) return null;
+            if (live.len <= st.reply_start or std.mem.startsWith(i32, prompt, live)) return null;
             const end = for (prompt[common..], common..) |t, i| {
                 if (std.mem.indexOfScalar(u32, st.eos, @intCast(t)) != null) break i;
             } else return null;
+            const n = @min(reply_tail_tokens, end - common, live.len - st.reply_start);
+            if (n == 0 or !std.mem.eql(i32, prompt[end - n .. end], live[live.len - n ..])) return null;
             const len = live.len + (prompt.len - end);
             if (len + max_tokens > st.ctx) return null;
             const tokens = try gpa.alloc(i32, len);
             @memcpy(tokens[0..live.len], live);
             @memcpy(tokens[live.len..], prompt[end..]);
             return .{ .tokens = tokens, .covered = end };
+        }
+
+        /// The client's view of what the session now holds, for the next request's `keptReply`.
+        fn rememberPrompt(st: *State, prompt: []const i32, synced: usize) !void {
+            const copy = try gpa.dupe(i32, prompt);
+            gpa.free(st.client_prompt);
+            st.client_prompt = copy;
+            st.reply_start = synced;
+        }
+
+        fn forgetPrompt(st: *State) void {
+            gpa.free(st.client_prompt);
+            st.client_prompt = &.{};
+            st.reply_start = 0;
         }
 
         /// Sync the session to the prompt (ds4 keeps the common prefix in its live KV), then decode round by round.
@@ -345,12 +369,13 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             defer if (kept) |k| gpa.free(k.tokens);
             const synced = if (kept) |k| k.tokens else prompt;
             const cached: usize = if (kept) |k| k.covered else @intCast(@max(st.session.commonPrefix(prompt) catch 0, 0));
-            st.session.sync(synced, &r.cancelled) catch |err| switch (err) {
+            st.session.sync(synced, &r.cancelled) catch |err| {
+                forgetPrompt(st);
                 // ds4 rebuilds a half-done pass on the next sync; the complete prefix stays cached.
-                error.SyncInterrupted => return .cancelled,
-                else => return err,
+                if (err == error.SyncInterrupted) return .cancelled;
+                return err;
             };
-            st.reply_start = synced.len;
+            try rememberPrompt(st, prompt, synced.len);
             if (r.prefilled(@intCast(cached))) |why| return why;
 
             var rng = r.seed();
@@ -731,18 +756,34 @@ test "ds4 adapter: a client's copy of the last reply stands in for the sampled o
     const one = try liveAfter(path, &.{&turn1}, &one_buf);
     try testing.expect(one.len > turn1.len);
 
-    // The client's copy of the reply ([9, 9]) differs from what was sampled; then its end of turn (2) and a new turn.
-    const turn2 = turn1 ++ [_]u32{ 9, 9, 2, 16 };
+    // The client's copy of the reply ([9, 50, 50]) differs from what was sampled but closes the same way; then its end
+    // of turn (2) and a new turn.
+    const turn2 = turn1 ++ [_]u32{ 9, 50, 50, 2, 16 };
     var two_buf: [64]i32 = undefined;
     const two = try liveAfter(path, &.{ &turn1, &turn2 }, &two_buf);
     try testing.expectEqualSlices(i32, one, two[0..one.len]);
     try testing.expectEqualSlices(i32, &.{ 2, 16 }, two[one.len .. one.len + 2]);
 
+    // The next turn re-sends both copies: the client's view grows, the session keeps both sampled replies.
+    const turn3 = turn2 ++ [_]u32{ 9, 50, 50, 2, 17 };
+    var three_live: [64]i32 = undefined;
+    const kept3 = try liveAfter(path, &.{ &turn1, &turn2, &turn3 }, &three_live);
+    try testing.expectEqualSlices(i32, two, kept3[0..two.len]);
+    try testing.expectEqualSlices(i32, &.{ 2, 17 }, kept3[two.len .. two.len + 2]);
+
+    // A client that dropped the reply and wrote a turn of its own keeps its turn: nothing it sent is replaced.
+    const own_turn = turn1 ++ [_]u32{ 7, 7, 2, 16 };
+    var own_live: [64]i32 = undefined;
+    const own = try liveAfter(path, &.{ &turn1, &own_turn }, &own_live);
+    var own_want: [own_turn.len]i32 = undefined;
+    for (own_turn, &own_want) |t, *w| w.* = @intCast(t);
+    try testing.expectEqualSlices(i32, &own_want, own[0..own_want.len]);
+
     // A history that changed before the reply is synced as sent.
-    const edited = [_]u32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 2, 16 };
+    const edited = [_]u32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 50, 50, 2, 16 };
     var three_buf: [64]i32 = undefined;
     const three = try liveAfter(path, &.{ &turn1, &edited }, &three_buf);
-    const want = [_]i32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 2, 16 };
+    const want = [_]i32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 50, 50, 2, 16 };
     try testing.expectEqualSlices(i32, &want, three[0..want.len]);
 }
 
