@@ -314,9 +314,10 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         /// How far before the end of its last prompt a client's copy of the reply may begin to differ: the reasoning
         /// opener of the generation prompt, which a template renders differently in history.
         const reply_opener_tokens = 4;
-        /// A client's copy must close as the sampled reply did (a re-serialized tool call still ends `</tool_call>`);
-        /// a client that dropped the reply and wrote a turn of its own does not.
-        const reply_tail_tokens = 2;
+        /// A client's copy must close as the sampled reply did, compared as text (a re-serialized tool call still ends
+        /// `</tool_call>`, though its tokens may split differently); a client that dropped the reply and wrote a turn
+        /// of its own does not.
+        const reply_tail_bytes = 16;
 
         const Kept = struct { tokens: []i32, covered: usize };
 
@@ -332,17 +333,43 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             const live = try st.session.liveTokens(gpa);
             defer gpa.free(live);
             if (live.len <= st.reply_start or std.mem.startsWith(i32, prompt, live)) return null;
-            const end = for (prompt[common..], common..) |t, i| {
-                if (std.mem.indexOfScalar(u32, st.eos, @intCast(t)) != null) break i;
-            } else return null;
-            const n = @min(reply_tail_tokens, end - common, live.len - st.reply_start);
-            if (n == 0 or !std.mem.eql(i32, prompt[end - n .. end], live[live.len - n ..])) return null;
-            const len = live.len + (prompt.len - end);
+            const end = endOfTurn(st, prompt, common) orelse return null;
+            // A speculative round may have evaluated the reply's end-of-turn token and what follows it; the copy's
+            // own end then continues that tail rather than repeating it.
+            const live_end = endOfTurn(st, live, st.reply_start) orelse live.len;
+            var copy_buf: [4 * reply_tail_bytes]u8 = undefined;
+            var sampled_buf: [4 * reply_tail_bytes]u8 = undefined;
+            const copy = textTail(st, prompt[common..end], &copy_buf);
+            const sampled = textTail(st, live[st.reply_start..live_end], &sampled_buf);
+            const n = @min(copy.len, sampled.len);
+            if (n == 0 or !std.mem.eql(u8, copy[copy.len - n ..], sampled[sampled.len - n ..])) return null;
+            const len = live_end + (prompt.len - end);
             if (len + max_tokens > st.ctx) return null;
             const tokens = try gpa.alloc(i32, len);
-            @memcpy(tokens[0..live.len], live);
-            @memcpy(tokens[live.len..], prompt[end..]);
+            @memcpy(tokens[0..live_end], live[0..live_end]);
+            @memcpy(tokens[live_end..], prompt[end..]);
             return .{ .tokens = tokens, .covered = end };
+        }
+
+        /// The first end-of-turn (stop) token in `tokens` at or after `from`.
+        fn endOfTurn(st: *State, tokens: []const i32, from: usize) ?usize {
+            for (tokens[from..], from..) |t, i| if (std.mem.indexOfScalar(u32, st.eos, @intCast(t)) != null) return i;
+            return null;
+        }
+
+        /// The last `reply_tail_bytes` that `tokens` decode to, trailing whitespace dropped.
+        fn textTail(st: *State, tokens: []const i32, buf: []u8) []const u8 {
+            var at = buf.len;
+            var i = tokens.len;
+            while (i > 0 and at > 0) {
+                i -= 1;
+                const b = st.tokens.get(gpa, st.engine, @intCast(tokens[i]));
+                const take = @min(b.len, at);
+                @memcpy(buf[at - take .. at], b[b.len - take ..]);
+                at -= take;
+            }
+            const text = std.mem.trimEnd(u8, buf[at..], " \t\r\n");
+            return text[text.len -| reply_tail_bytes ..];
         }
 
         /// The client's view of what the session now holds, for the next request's `keptReply`.
@@ -524,11 +551,14 @@ const FakeBridge = struct {
     pub const Ds4Session = struct {
         toks: std.ArrayList(i32) = .empty,
         row: [vocab]f32 = @splat(0),
+        /// Set by a prompt holding 998: from this length on the fake favours its end-of-turn token (2).
+        stop_at: usize = 0,
 
         fn refresh(s: *Ds4Session) void {
             s.row = @splat(0);
             s.row[50] = 2;
             s.row[100 + s.toks.items.len % 800] = 1;
+            if (s.stop_at != 0 and s.toks.items.len >= s.stop_at) s.row[2] = 3;
         }
         pub fn free(s: *Ds4Session) void {
             s.toks.deinit(testing.allocator);
@@ -550,6 +580,7 @@ const FakeBridge = struct {
             if (cancel) |c| if (c.load(.acquire)) return error.SyncInterrupted;
             s.toks.clearRetainingCapacity();
             try s.toks.appendSlice(testing.allocator, p);
+            s.stop_at = if (std.mem.indexOfScalar(i32, p, 998) != null) p.len + 2 else 0;
             s.refresh();
         }
         pub fn eval(s: *Ds4Session, t: i32) !void {
@@ -724,12 +755,17 @@ test "ds4 adapter: a GGUF's own chat template goes to the host's Jinja, except D
 /// Runs `prompts` one after another on one opened session (plain greedy rounds, 3 tokens each); the tokens the
 /// session holds afterwards, copied into `out`.
 fn liveAfter(path: []const u8, prompts: []const []const u32, out: []i32) ![]i32 {
+    return liveAfterWith(path, "{\"prefill_chunk\":1}", &.{}, prompts, out);
+}
+
+/// `liveAfter` with the open's `settings` (drafts on unless `prefill_chunk` is 1) and the requests' `eos`.
+fn liveAfterWith(path: []const u8, settings: []const u8, eos: []const u32, prompts: []const []const u32, out: []i32) ![]i32 {
     var host: abi.Host = .{ .ctx = undefined, .log = struct {
         fn f(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
     }.f, .wake = struct {
         fn f(_: *anyopaque) callconv(.c) void {}
     }.f };
-    const o: abi.Open = .{ .model_dir = abi.span(u8, path), .model_type = .{}, .config_json = .{}, .context = 0, .max_concurrent = 1, .memory_budget = 0, .settings_json = abi.span(u8, "{\"prefill_chunk\":1}"), .options_json = .{}, .host = &host };
+    const o: abi.Open = .{ .model_dir = abi.span(u8, path), .model_type = .{}, .config_json = .{}, .context = 0, .max_concurrent = 1, .memory_budget = 0, .settings_json = abi.span(u8, settings), .options_json = .{}, .host = &host };
     var info: abi.Info = undefined;
     var v: abi.Verdict = .{};
     const e = Fake.table.open(&o, &info, &v) orelse return error.Open;
@@ -737,7 +773,7 @@ fn liveAfter(path: []const u8, prompts: []const []const u32, out: []i32) ![]i32 
     for (prompts, 1..) |p, id| {
         var c: Collect = .{};
         defer c.deinit();
-        const req: abi.Request = .{ .prompt = abi.span(u32, p), .max_tokens = 3, .sampling = .{ .temperature = 0 } };
+        const req: abi.Request = .{ .prompt = abi.span(u32, p), .max_tokens = 3, .sampling = .{ .temperature = 0 }, .eos = abi.span(u32, eos) };
         if (Fake.table.submit(e, id, &req, c.sink()).code != .ok) return error.Refused;
         c.wait();
     }
@@ -756,16 +792,16 @@ test "ds4 adapter: a client's copy of the last reply stands in for the sampled o
     const one = try liveAfter(path, &.{&turn1}, &one_buf);
     try testing.expect(one.len > turn1.len);
 
-    // The client's copy of the reply ([9, 50, 50]) differs from what was sampled but closes the same way; then its end
+    // The client's copy of the reply ([9, 50, 50, 50]) differs from what was sampled but closes the same way; then its end
     // of turn (2) and a new turn.
-    const turn2 = turn1 ++ [_]u32{ 9, 50, 50, 2, 16 };
+    const turn2 = turn1 ++ [_]u32{ 9, 50, 50, 50, 2, 16 };
     var two_buf: [64]i32 = undefined;
     const two = try liveAfter(path, &.{ &turn1, &turn2 }, &two_buf);
     try testing.expectEqualSlices(i32, one, two[0..one.len]);
     try testing.expectEqualSlices(i32, &.{ 2, 16 }, two[one.len .. one.len + 2]);
 
     // The next turn re-sends both copies: the client's view grows, the session keeps both sampled replies.
-    const turn3 = turn2 ++ [_]u32{ 9, 50, 50, 2, 17 };
+    const turn3 = turn2 ++ [_]u32{ 9, 50, 50, 50, 2, 17 };
     var three_live: [64]i32 = undefined;
     const kept3 = try liveAfter(path, &.{ &turn1, &turn2, &turn3 }, &three_live);
     try testing.expectEqualSlices(i32, two, kept3[0..two.len]);
@@ -780,11 +816,27 @@ test "ds4 adapter: a client's copy of the last reply stands in for the sampled o
     try testing.expectEqualSlices(i32, &own_want, own[0..own_want.len]);
 
     // A history that changed before the reply is synced as sent.
-    const edited = [_]u32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 50, 50, 2, 16 };
+    const edited = [_]u32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 50, 50, 50, 2, 16 };
     var three_buf: [64]i32 = undefined;
     const three = try liveAfter(path, &.{ &turn1, &edited }, &three_buf);
-    const want = [_]i32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 50, 50, 2, 16 };
+    const want = [_]i32{ 5, 99, 7, 8, 10, 11, 12, 13, 14, 15, 9, 50, 50, 50, 2, 16 };
     try testing.expectEqualSlices(i32, &want, three[0..want.len]);
+}
+
+test "ds4 adapter: a reply whose speculative round evaluated its end of turn is continued, not repeated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try ds4Gguf(&tmp, &buf);
+    // 998: the fake drafts its end-of-turn token (2) two tokens into the reply, inside one speculative round.
+    const turn1 = [_]u32{ 5, 998, 7, 8, 10, 11, 12, 13, 14, 15 };
+    const turn2 = turn1 ++ [_]u32{ 9, 50, 50, 2, 16 };
+    var live_buf: [64]i32 = undefined;
+    const live = try liveAfterWith(path, "", &.{2}, &.{ &turn1, &turn2 }, &live_buf);
+    var want: [turn1.len + 4]i32 = undefined;
+    for (turn1, want[0..turn1.len]) |t, *w| w.* = @intCast(t);
+    @memcpy(want[turn1.len..], &[_]i32{ 50, 50, 2, 16 });
+    try testing.expectEqualSlices(i32, &want, live[0..want.len]);
 }
 
 const Collect = struct {
