@@ -12,7 +12,6 @@ pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
-const gguf_files = @import("sdk/quant/gguf/files.zig");
 const model_mod = @import("sdk/config/model.zig");
 const tokenizer_mod = @import("sdk/tokenizer/tokenizer.zig");
 pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
@@ -2036,10 +2035,7 @@ fn runGgufServe(
         return err;
     };
     defer allocator.free(gguf_path);
-    // Absent an explicit per-model or server-wide --ctx-size, size this session from the
-    // checkpoint's own declared `<arch>.context_length` instead of ds4's unrelated CLI default
-    // (0 plans ds4's memory for a fixed 32768 regardless of checkpoint).
-    const model_ctx = settings.ctx_size orelse (if (ctx_size != 0) ctx_size else gguf_files.declaredContextLength(allocator, gguf_path));
+    const model_ctx = settings.ctx_size orelse ctx_size;
 
     log.info("mlx-serve {s} ({s} engine, GGUF backend)\n", .{ VERSION, if (engine == .ds4) "ds4" else "llama.cpp" });
     log.info("[args] model: {s}\n", .{gguf_path});

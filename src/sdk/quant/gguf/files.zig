@@ -3,21 +3,6 @@
 
 const std = @import("std");
 const gguf_meta = @import("engine_pick.zig");
-const gguf_root = @import("root.zig");
-
-/// This GGUF's own `<arch>.context_length` metadata key (the standard llama.cpp/GGUF convention), read
-/// straight off the file's own KV store independent of whether the MLX engine's Arch table claims the
-/// arch — a ds4-only arch (deepseek4, glm-dsa, glm5-next) carries its trained context this way too. 0
-/// when the file can't be opened or carries no such key; callers fall back to their own default.
-pub fn declaredContextLength(allocator: std.mem.Allocator, gguf_path: []const u8) u32 {
-    var f = gguf_root.gguf.File.open(allocator, gguf_path) catch return 0;
-    defer f.deinit();
-    const arch = f.getString("general.architecture") orelse return 0;
-    var kb: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&kb, "{s}.context_length", .{arch}) catch return 0;
-    const v = f.getInt(key) orelse return 0;
-    return if (v > 0) @as(u32, @intCast(@min(v, std.math.maxInt(u32)))) else 0;
-}
 
 /// Result of scanning a directory for LLM `.gguf` files (mmproj sidecars
 /// excluded). `pick` is the alphabetically-smallest LLM gguf basename — the
