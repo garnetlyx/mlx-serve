@@ -79,7 +79,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             vocab: usize,
             eos: []u32,
             tokens: TokenTable,
-            file_bytes: u64,
+            mapped_bytes: u64,
             thread: std.Thread = undefined,
             startup_buf: [96]u8 = undefined,
         };
@@ -93,18 +93,26 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             return st.size;
         }
 
-        /// The GGUF and ds4's own estimate of the session's KV and scratch.
+        /// What the GGUF header says about the open: its trained window and the bytes ds4 never maps.
+        const Meta = struct { trained: u32 = 0, disk_only: u64 = 0 };
+
+        fn ggufMeta(path: []const u8) Meta {
+            var info = engine_pick.readFromFile(io, gpa, path) catch return .{};
+            defer info.deinit(gpa);
+            return .{ .trained = info.context_length, .disk_only = info.ds4_disk_only_bytes };
+        }
+
+        /// The GGUF less what ds4 never maps, and ds4's own estimate of the session's KV and scratch.
         fn loadBytes(o: *const abi.Open, bytes: *u64) callconv(.c) abi.Verdict {
-            bytes.* = fileBytes(abi.items(u8, o.model_dir)) + B.contextBytes(askedContext(o));
+            const path = abi.items(u8, o.model_dir);
+            const meta = ggufMeta(path);
+            bytes.* = (fileBytes(path) -| meta.disk_only) + B.contextBytes(askedContext(o, meta));
             return .{};
         }
 
         /// The session asked for: `o.context`, else the GGUF's trained window (`<arch>.context_length`), else ds4's default.
-        fn askedContext(o: *const abi.Open) u32 {
-            if (o.context != 0) return B.clampSessionCtx(o.context);
-            var info = engine_pick.readFromFile(io, gpa, abi.items(u8, o.model_dir)) catch return B.clampSessionCtx(0);
-            defer info.deinit(gpa);
-            return B.clampSessionCtx(info.context_length);
+        fn askedContext(o: *const abi.Open, meta: Meta) u32 {
+            return B.clampSessionCtx(if (o.context != 0) o.context else meta.trained);
         }
 
         fn parseFlags(json: []const u8) !load.Flags {
@@ -124,7 +132,8 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         fn openOrError(o: *const abi.Open, info: *abi.Info) !*State {
             const path = abi.items(u8, o.model_dir);
             const flags = parseFlags(abi.items(u8, o.settings_json)) catch return error.InvalidSettings;
-            var ctx = askedContext(o);
+            const meta = ggufMeta(path);
+            var ctx = askedContext(o, meta);
             const engine = try load.open(B, io, gpa, path, flags, ctx);
             errdefer engine.close();
             const session = engine.createSession(@intCast(ctx)) catch |err| retry: {
@@ -161,7 +170,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .vocab = vocab,
                 .eos = try eos.toOwnedSlice(gpa),
                 .tokens = tokens,
-                .file_bytes = fileBytes(path),
+                .mapped_bytes = fileBytes(path) -| meta.disk_only,
             };
             errdefer gpa.free(st.eos);
             st.thread = try std.Thread.spawn(.{}, work, .{st});
@@ -211,7 +220,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         /// What props has always shown for ds4: the GGUF plus the session's estimate (ds4 allocates outside MLX).
         fn memory(e: *anyopaque, out: *abi.Memory) callconv(.c) void {
             const st = state(e);
-            const active = st.file_bytes + B.contextBytes(st.ctx);
+            const active = st.mapped_bytes + B.contextBytes(st.ctx);
             out.* = .{ .active = active, .cache = 0, .peak = active };
         }
 

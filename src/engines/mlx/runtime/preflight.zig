@@ -168,6 +168,11 @@ fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
     return out;
 }
 
+/// A GGUF's discovered bytes less what its engine never maps (`Route.disk_only_bytes`).
+pub fn ggufGateBytes(discovered: ?u64, disk_only: u64) ?u64 {
+    return if (discovered) |b| b -| disk_only else null;
+}
+
 pub fn residentGateBytes(validated: ?u64, discovered: ?u64, mlx_text: bool) ?u64 {
     if (!mlx_text) return discovered;
     if (validated) |bytes| if (bytes > 0) return bytes;
@@ -367,6 +372,9 @@ test "GGUF and unavailable media peak retain discovery bytes at the eviction gat
     try std.testing.expectEqual(@as(?u64, 100 * GB), residentGateBytes(0, 100 * GB, true));
     try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(0, null, true));
     try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(null, 0, false));
+    // A ds4 Qwen GGUF's n-gram table is read from disk, never mapped: the gate bills the rest.
+    try std.testing.expectEqual(@as(?u64, 45 * GB), ggufGateBytes(147 * GB, 102 * GB));
+    try std.testing.expectEqual(@as(?u64, null), ggufGateBytes(null, 102 * GB));
 }
 
 test "a text pack's gate margin stops growing with its weights" {

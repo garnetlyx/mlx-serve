@@ -37,7 +37,16 @@ pub const Engine = enum { ds4, llama };
 pub const Route = struct {
     path: []const u8,
     engine: Engine,
+    /// What the engine never maps (`Info.ds4_disk_only_bytes`): the eviction gate leaves it out.
+    disk_only_bytes: u64 = 0,
 };
+
+/// `Info.ds4_disk_only_bytes` of the GGUF at `path`; 0 when its header cannot be read.
+pub fn ds4DiskOnlyBytes(io: std.Io, allocator: std.mem.Allocator, path: []const u8) u64 {
+    var info = readFromFile(io, allocator, path) catch return 0;
+    defer info.deinit(allocator);
+    return info.ds4_disk_only_bytes;
+}
 
 pub const Info = struct {
     /// Owned dupe of `general.architecture` value; null if the key was
@@ -55,6 +64,8 @@ pub const Info = struct {
     split_count: u32 = 1,
     /// `<arch>.context_length`: the window the checkpoint was trained for; 0 when absent.
     context_length: u32 = 0,
+    /// qwen4exp only: the BF16 n-gram table ds4 reads from disk per token and never maps.
+    ds4_disk_only_bytes: u64 = 0,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -190,7 +201,11 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     }
 
     if (info.architecture) |a| {
-        if (std.mem.eql(u8, a, "qwen4exp")) info.ds4_unloadable = try scanDs4Unloadable(r, tensor_count);
+        if (std.mem.eql(u8, a, "qwen4exp")) {
+            const scan = try scanDs4Tensors(r, tensor_count);
+            info.ds4_unloadable = scan.unloadable;
+            info.ds4_disk_only_bytes = scan.ngram_bytes;
+        }
     }
     if (info.embedded_mtp) info.embedded_mtp = for (ds4_embedded_mtp_archs) |d| {
         if (info.architecture != null and std.mem.eql(u8, info.architecture.?, d)) break true;
@@ -198,9 +213,12 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     return info;
 }
 
-/// Walk the tensor infos that follow the KVs; true at the first tensor ds4
-/// would reject for a qwen4exp model.
-fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
+const Ds4Scan = struct { unloadable: bool = false, ngram_bytes: u64 = 0 };
+
+/// Walk the tensor infos that follow the KVs of a qwen4exp model: unloadable at the first tensor ds4 would reject,
+/// and the size of the BF16 n-gram table ds4 reads from disk instead of mapping (`model_unmap_qwen_ngrams`).
+fn scanDs4Tensors(r: *std.Io.Reader, tensor_count: u64) Error!Ds4Scan {
+    var out: Ds4Scan = .{};
     var i: u64 = 0;
     while (i < tensor_count) : (i += 1) {
         const name_len = takeIntT(r, u64) catch return error.Truncated;
@@ -208,13 +226,17 @@ fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
         const is_ngrams = std.mem.eql(u8, takeBytes(r, @intCast(name_len)) catch return error.Truncated, "per_layer_token_embd.weight");
         const n_dims = takeIntT(r, u32) catch return error.Truncated;
         if (n_dims > GGML_MAX_DIMS) return error.Truncated;
-        r.discardAll64(@as(u64, n_dims) * 8) catch return error.Truncated;
+        var elems: u64 = 1;
+        for (0..n_dims) |_| elems *|= takeIntT(r, u64) catch return error.Truncated;
         const ty = takeIntT(r, u32) catch return error.Truncated;
         _ = takeIntT(r, u64) catch return error.Truncated; // offset
-        if (std.mem.indexOfScalar(u32, &ds4_qwen_tensor_types, ty) == null) return true;
-        if (is_ngrams and ty != GGML_TYPE_BF16) return true;
+        if (std.mem.indexOfScalar(u32, &ds4_qwen_tensor_types, ty) == null or (is_ngrams and ty != GGML_TYPE_BF16)) {
+            out.unloadable = true;
+            return out;
+        }
+        if (is_ngrams) out.ngram_bytes = elems *| 2;
     }
-    return false;
+    return out;
 }
 
 /// True when the header names a pooling type (`<arch>.pooling_type` > 0), llama.cpp's
@@ -539,6 +561,25 @@ test "preferredEngine: qwen4exp routes by tensor types ds4 can load" {
         defer info.deinit(testing.allocator);
         try testing.expectEqual(c.want, preferredEngine(info));
     }
+}
+
+test "a qwen4exp BF16 n-gram table is the bytes ds4 never maps; another arch has none" {
+    const qwen: []const KV = &.{.{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } }};
+    const with_table = try buildHeaderWithTensors(testing.allocator, qwen, &.{
+        .{ .name = "blk.0.ffn_down_exps.weight", .ggml_type = 12 }, // Q4_K
+        .{ .name = "per_layer_token_embd.weight", .ggml_type = 30 }, // BF16, 640 x 2560
+    });
+    defer testing.allocator.free(with_table);
+    var a = try parseBytes(testing.allocator, with_table);
+    defer a.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 640 * 2560 * 2), a.ds4_disk_only_bytes);
+
+    const glm: []const KV = &.{.{ .key = "general.architecture", .value = .{ .str = "glm5-next" } }};
+    const other_arch = try buildHeaderWithTensors(testing.allocator, glm, &.{.{ .name = "per_layer_token_embd.weight", .ggml_type = 30 }});
+    defer testing.allocator.free(other_arch);
+    var b = try parseBytes(testing.allocator, other_arch);
+    defer b.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 0), b.ds4_disk_only_bytes);
 }
 
 test "preferredEngine: deepseek4 + lora_rank → ds4" {
