@@ -15,6 +15,7 @@ const http_server = @import("../../../host/http/server.zig");
 const manualContext = @import("../../../host/http/server.zig").manualContext;
 const physicalMemoryCeiling = @import("../../../host/registry/memory_ceiling.zig").physicalMemoryCeiling;
 const currentGpuMemoryCeiling = @import("../../../host/registry/memory_ceiling.zig").currentGpuMemoryCeiling;
+const memoryCeilingOverrides = @import("../../../host/registry/memory_ceiling.zig").overrides;
 const defaultKvBits = @import("bills.zig").defaultKvBits;
 const prefillTransientReserve = @import("bills.zig").prefillTransientReserve;
 const pinPrefillChunk = @import("prefill_chunk.zig").pinPrefillChunk;
@@ -70,7 +71,18 @@ pub fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
 }
 
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    return autoContextFrom(computeMemoryContext(config), config.contextCap());
+    // A ds4-streaming GGUF's OWN per-session admission (qwen4_streaming_memory_admit,
+    // glm_graph_memory_guard_for_compact_cap) prices this entry's actual KV/graph need
+    // against the LIVE Metal working set and shrinks its expert cache to whatever is
+    // left -- refusing cleanly, not crashing, only when the KV/graph alone does not fit.
+    // computeMemoryContext's own subtraction of this entry's resident-weights bill from
+    // the ceiling is a second, independent guess on top of that already-live guard: a
+    // live Qwen3.8-Flash-Next-Q2 session ran ds4's own full 262144-token plan while this
+    // branch still recomputed and advertised 26624 (2026-11-04). Skip straight to the
+    // checkpoint's own max; ds4's guard is the real backstop.
+    const cap = config.contextCap();
+    if (config.ds4_ssd_streaming_route and cap > 0) return cap;
+    return autoContextFrom(computeMemoryContext(config), cap);
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -102,6 +114,11 @@ pub fn logPinnedContext(config: *const model_mod.ModelConfig, pinned: u32) void 
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
     } else if (config.mlxStream()) {
         log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
+    } else if (config.ds4_ssd_streaming_route) {
+        // autoContextFor skipped the memory subtraction here: ds4's own per-session
+        // admission prices this entry's KV/graph live and shrinks its expert cache
+        // to fit, so the checkpoint's own maximum is what we advertise.
+        log.info("Context size: {d} tokens (auto: the model's maximum; ds4 --ssd-streaming prices KV/graph live and shrinks its own expert cache to fit) [pinned]\n", .{pinned});
     } else {
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = safeAutoContext(memory_ctx);
@@ -281,6 +298,50 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     const got = autoContextFor(&unbounded);
     try testing.expect(got > 0);
     try testing.expectEqual(safeAutoContext(computeMemoryContext(&unbounded)), got);
+}
+
+test "autoContextFor: a ds4-streaming route serves the checkpoint max, bypassing the redundant memory shrink" {
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 0;
+    const orig_reserve = system_vars.os_reserve_override;
+    defer system_vars.os_reserve_override = orig_reserve;
+    system_vars.os_reserve_override = 0;
+    // Pin the working-set ceiling to 2 GiB regardless of the host's real RAM --
+    // the point is to prove the BEHAVIOR (streaming route skips the shrink),
+    // not to depend on how much memory the CI runner happens to have free.
+    const orig_ceiling = memoryCeilingOverrides().static_ceiling;
+    defer memoryCeilingOverrides().static_ceiling = orig_ceiling;
+    memoryCeilingOverrides().static_ceiling = 2 * 1024 * 1024 * 1024;
+
+    // A big GGUF checkpoint (262,144-token max). A 2 GiB ceiling cannot hold a
+    // fraction of that in KV cache, so the memory path shrinks it hard -- the
+    // exact shape of the real bug (a 262144-token Qwen3-Next GGUF cut to ~27k).
+    var config = model_mod.ModelConfig{};
+    config.max_position_embeddings = 262144;
+    config.num_attention_heads = 64;
+    config.num_hidden_layers = 48;
+    config.num_key_value_heads = 8;
+    config.head_dim = 128;
+    config.hidden_size = 8192;
+    config.intermediate_size = 28672;
+
+    // Baseline: confirm the memory path alone WOULD shrink this far below the
+    // checkpoint's max under the pinned ceiling -- otherwise this test would not
+    // be exercising the redundant-conservatism case the fix targets.
+    const memory_only = autoContextFrom(computeMemoryContext(&config), config.contextCap());
+    try testing.expect(memory_only < config.max_position_embeddings);
+
+    // Not ds4-routed: unchanged, still the shrunk memory figure (no regression
+    // for every other config shape).
+    try testing.expectEqual(memory_only, autoContextFor(&config));
+
+    // ds4-streaming routed: skip the memory guess entirely and serve the
+    // checkpoint's declared max -- ds4's own per-session admission
+    // (qwen4_streaming_memory_admit / glm_graph_memory_guard_for_compact_cap)
+    // is the real backstop against an actual OOM.
+    config.ds4_ssd_streaming_route = true;
+    try testing.expectEqual(@as(u32, 262144), autoContextFor(&config));
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {

@@ -491,6 +491,18 @@ pub const ModelConfig = struct {
     /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     glm_stream: bool = false,
+    /// This GGUF is routed to the embedded ds4 engine with `--ssd-streaming` active
+    /// (`ds4_streamed` in scheduler.zig/engine_load.zig). ds4's own per-session admission
+    /// (`qwen4_streaming_memory_admit`, `glm_graph_memory_guard_for_compact_cap`) prices THIS
+    /// request's KV/graph against the live Metal working set first and shrinks its expert cache
+    /// to whatever is left, refusing cleanly (not crashing) only when the KV/graph alone does not
+    /// fit -- so the auto-context sizer's own memory subtraction (`computeMemoryContext`) is a
+    /// second, redundant guess on top of a guard that already adapts live and already ran: a live
+    /// Qwen3.8-Flash-Next-Q2 session actually ran ds4's own full 262144-token plan while this field
+    /// was still false, yet /v1/models kept advertising 26624 (2026-11-04). `autoContextFor` skips
+    /// straight to the checkpoint's own max for this entry instead. Set by the same call sites that
+    /// compute `ds4_streamed` for the admission bill.
+    ds4_ssd_streaming_route: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,

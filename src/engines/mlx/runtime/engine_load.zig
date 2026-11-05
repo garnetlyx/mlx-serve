@@ -167,6 +167,7 @@ fn install(sch: *Scheduler, params: anytype, s: *Served, drafter_path: []const u
         entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(sch.allocator, params.tokenize_cache_entries);
     }
     const ds4_streamed = if (params.gguf) |g| g.engine == .ds4 and params.ds4_ssd_streaming else false;
+    params.config.ds4_ssd_streaming_route = ds4_streamed;
     const bill = preflight.ds4StreamingBill(s.residentBytes(), if (ds4_streamed) mlx.maxRecommendedWorkingSet() else 0);
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bill);

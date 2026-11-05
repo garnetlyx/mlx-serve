@@ -746,6 +746,22 @@ fn loadAfterUnloadingIdle(comptime T: type, ctx: anytype, load: fn (@TypeOf(ctx)
     }
 }
 
+/// PURE: the ctx_size to request for a cold-load GGUF absent a per-model `model-settings.json`
+/// override: `global_ctx_size` (the server-wide `--ctx-size`) when the operator set one
+/// explicitly, else `declared_cap` (this checkpoint's own `<arch>.context_length`, from
+/// `LoadedModel.ggufContextCap`) so a ds4-only arch (deepseek4, glm-dsa, glm5-next) sizes its
+/// session from the model's real trained window instead of ds4's unrelated CLI default (0 plans
+/// ds4's memory for a fixed 32768 regardless of checkpoint), else 0 when neither is known.
+fn ctxSizeFromDefaults(global_ctx_size: u32, declared_cap: u32) u32 {
+    return if (global_ctx_size != 0) global_ctx_size else declared_cap;
+}
+
+test "ctxSizeFromDefaults: an explicit --ctx-size wins; otherwise the checkpoint's declared cap; else 0" {
+    try testing.expectEqual(@as(u32, 8192), ctxSizeFromDefaults(8192, 262144));
+    try testing.expectEqual(@as(u32, 262144), ctxSizeFromDefaults(0, 262144));
+    try testing.expectEqual(@as(u32, 0), ctxSizeFromDefaults(0, 0));
+}
+
 fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
     // A lost GPU context fails every MLX call: nothing is loaded or served until a restart.
     if (mlx.gpuContextLost()) return error.GpuContextLost;
@@ -770,7 +786,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
     // same parse error). FileNotFound / parse errors land here.
     var settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
     defer settings.deinit(self.allocator);
-    const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse self.gguf_ctx_size, settings.ggufEngine()) catch |err| {
+    const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse ctxSizeFromDefaults(self.gguf_ctx_size, entry.ggufContextCap(self.io)), settings.ggufEngine()) catch |err| {
         self.registry.mutex.lockUncancelable(self.io);
         self.registry.markErrorLocked(entry, @errorName(err));
         self.registry.mutex.unlock(self.io);
@@ -862,6 +878,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         // Estimate post-load bytes (see `gateEstimateBytes` for why a media
         // entry cannot be billed by its directory's size).
         const ds4_streamed = if (owned.gguf) |g| g.engine == .ds4 and self.ds4_ssd_streaming else false;
+        owned.config.ds4_ssd_streaming_route = ds4_streamed;
         const estimated: u64 = preflight.gateEstimateBytesFor(media_peak, gate_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size, if (ds4_streamed) mlx.maxRecommendedWorkingSet() else 0) +
             pleTableBill(self.io, owned.config);
 

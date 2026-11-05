@@ -32,6 +32,7 @@ const gen_mod = @import("../media_jobs/gen.zig");
 const log = @import("../../sdk/util/log.zig");
 const handles = @import("../../abi/mlx_handles.zig");
 const mlx_engine = @import("../engines/mlx.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub const Generations = struct { load: std.atomic.Value(u64) = .init(0), last_unload: UnloadMark = .{} };
@@ -248,12 +249,13 @@ pub const LoadedModel = struct {
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
-    /// This (unloaded) GGUF entry's own `<arch>.context_length` GGUF metadata
-    /// key (the standard llama.cpp convention), read straight off the file's KV
-    /// store regardless of whether the MLX engine's Arch table claims the arch —
-    /// a ds4-only arch (deepseek4, glm-dsa, glm5-next) still advertises its
+    /// This GGUF entry's own `<arch>.context_length` GGUF metadata key (the
+    /// standard llama.cpp convention), read straight off the file's KV store
+    /// regardless of whether the MLX engine's Arch table claims the arch — a
+    /// ds4-only arch (deepseek4, glm-dsa, glm5-next) still advertises its
     /// trained context this way. 0 = no such key or the file/arch couldn't be
-    /// read; answered once, like the claim above.
+    /// read; answered once, on the first `/v1/models` render OR load
+    /// (whichever comes first), by `ggufContextCap` below.
     gguf_ctx_cap: ?u32 = null,
     /// The engines whose probe accepts this pack (`model_row_facts.Engines` bits); answered once, like the claim.
     engines: ?u8 = null,
@@ -378,6 +380,23 @@ pub const LoadedModel = struct {
     pub fn servesGguf(self: *const LoadedModel) bool {
         const e = self.engine orelse return false;
         return e.kind == .ds4 or e.kind == .llama;
+    }
+
+    /// This (possibly still unloaded) entry's declared context, memoized onto `gguf_ctx_cap` above. Read generically
+    /// off the GGUF file so a ds4-only arch can size its session from the checkpoint's own trained context instead
+    /// of the embedded engine's unrelated CLI default (ds4's own `--ctx-size 0` fallback is a fixed 32768, which has
+    /// nothing to do with any particular checkpoint's real window). 0 when the file/arch can't be read or carries no
+    /// such key — callers fall back to their own default in that case.
+    pub fn ggufContextCap(self: *LoadedModel, io: std.Io) u32 {
+        if (self.gguf_ctx_cap) |v| return v;
+        const allocator = std.heap.page_allocator;
+        const cap: u32 = blk: {
+            const path = gguf_files.resolveGgufFile(io, allocator, self.path) catch break :blk 0;
+            defer allocator.free(path);
+            break :blk gguf_files.declaredContextLength(allocator, path);
+        };
+        self.gguf_ctx_cap = cap;
+        return cap;
     }
 
     pub fn closeEngine(self: *LoadedModel) void {

@@ -14,8 +14,6 @@ const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const gguf_files = @import("../../sdk/quant/gguf/files.zig");
-const gguf_root = @import("../../sdk/quant/gguf/root.zig");
 const EngineKind = @import("../engines/served.zig").Kind;
 const media_mod = @import("../media_jobs/gen.zig");
 const metrics = @import("../status.zig");
@@ -73,29 +71,6 @@ fn mlxGgufClaims(io: std.Io, entry: *LoadedModel) bool {
         entry.mlx_gguf_claim = p != null;
     }
     return entry.mlx_gguf_claim.?;
-}
-
-/// This (unloaded) entry's `<arch>.context_length` GGUF metadata key — read
-/// generically off the file's own KV store (the standard llama.cpp/GGUF
-/// naming convention) rather than through the MLX engine's Arch table, so a
-/// ds4-only arch (deepseek4, glm-dsa, glm5-next) advertises its trained
-/// context too. 0 when the file/arch can't be read or carries no such key.
-fn ggufContextCap(io: std.Io, entry: *LoadedModel) u32 {
-    if (entry.gguf_ctx_cap) |v| return v;
-    const allocator = std.heap.page_allocator;
-    const cap: u32 = blk: {
-        const path = gguf_files.resolveGgufFile(io, allocator, entry.path) catch break :blk 0;
-        defer allocator.free(path);
-        var f = gguf_root.gguf.File.open(allocator, path) catch break :blk 0;
-        defer f.deinit();
-        const arch = f.getString("general.architecture") orelse break :blk 0;
-        var kb: [128]u8 = undefined;
-        const key = std.fmt.bufPrint(&kb, "{s}.context_length", .{arch}) catch break :blk 0;
-        const v = f.getInt(key) orelse break :blk 0;
-        break :blk if (v > 0) @as(u32, @intCast(@min(v, std.math.maxInt(u32)))) else 0;
-    };
-    entry.gguf_ctx_cap = cap;
-    return cap;
 }
 
 /// Render the JSON metadata fragment for one entry. For `.ready` entries
@@ -464,7 +439,7 @@ pub fn renderModelEntry(
     } else if (is_gguf_stub) blk: {
         // No config.json to read (issue #59); fall back to the GGUF's own
         // metadata so a ds4-routed arch still advertises a context window.
-        const cap = ggufContextCap(io, entry);
+        const cap = entry.ggufContextCap(io);
         if (cap == 0) break :blk @as([]const u8, &[_]u8{});
         break :blk try std.fmt.allocPrint(allocator, ",\"context_length\":{d},\"max_model_len\":{d}", .{ cap, cap });
     } else &[_]u8{};
