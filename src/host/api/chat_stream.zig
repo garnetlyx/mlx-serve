@@ -229,6 +229,8 @@ pub fn handleStreamingGeneration(
     ve_local = null;
     const sch = http_server.launch().global_scheduler.?;
     running = try mlx_engine.Running.submit(sch, .{
+    .peer_closed = Conn.peerClosedProbe,
+    .peer_closed_ctx = @ptrCast(stream),
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,

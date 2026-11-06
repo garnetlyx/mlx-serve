@@ -51,6 +51,8 @@ pub fn handle(
     const audio_id = speech_api.Store.newId(stream.io);
     const created = io_util.nowSecs(stream.io);
     const running = try mlx_engine.Running.submit(http_server.launch().global_scheduler.?, .{
+    .peer_closed = Conn.peerClosedProbe,
+    .peer_closed_ctx = @ptrCast(stream),
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,

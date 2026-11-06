@@ -251,6 +251,14 @@ pub const Conn = struct {
         if (r == 0) return true; // FIN: peer closed cleanly
         return false; // negative (EAGAIN) or data available → assume alive
     }
+
+    /// `SubmitParams.peer_closed` adapter: lets the scheduler's blocked
+    /// submit probe this connection without importing HTTP types. `ctx` is
+    /// this `*Conn`.
+    pub fn peerClosedProbe(ctx: *anyopaque) bool {
+        const c: *Conn = @ptrCast(@alignCast(ctx));
+        return c.peerClosed();
+    }
 };
 
 // ── tests ──

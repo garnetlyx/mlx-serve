@@ -70,6 +70,8 @@ pub fn nonStreamingViaScheduler(
     conn: ?*Conn,
 ) !request_mod.GenerationResult {
     const running = try mlx_engine.Running.submit(sch, .{
+    .peer_closed = if (conn != null) Conn.peerClosedProbe else null,
+    .peer_closed_ctx = if (conn) |c| @ptrCast(c) else null,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = full_prompt,

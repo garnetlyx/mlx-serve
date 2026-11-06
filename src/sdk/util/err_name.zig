@@ -28,6 +28,7 @@ pub const Known = error{
     Shutdown,
     UnknownModelId,
     WriteFailed,
+    ClientGone,
     QueueFull,
     ModelBusy,
     NotEmbeddingModel,

@@ -211,6 +211,14 @@ pub const SubmitParams = struct {
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
     client: metrics_mod.Client = .other,
+    /// Optional liveness probe for the submitting connection, evaluated when a
+    /// blocked submit wakes (queue space freed or an engine session released).
+    /// A request whose client died while queued (e.g. a short approval scan
+    /// stuck behind a 20-minute decode) is dropped before it claims the
+    /// session - running it would evict the live KV session the next real
+    /// request wants and decode a response nobody will read.
+    peer_closed: ?*const fn (*anyopaque) bool = null,
+    peer_closed_ctx: ?*anyopaque = null,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.

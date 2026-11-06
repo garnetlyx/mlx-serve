@@ -494,6 +494,15 @@ pub fn hasCompany(self: *Scheduler) bool {
     return self.in_flight > self.offloaded.items.len;
 }
 
+/// True when this request's client connection died while the submit was
+/// blocked waiting for queue space or an engine session. Null probe (internal
+/// callers, tests) → never dropped.
+fn clientGoneWhileQueued(params: *const SubmitParams) bool {
+    const probe = params.peer_closed orelse return false;
+    const ctx = params.peer_closed_ctx orelse return false;
+    return probe(ctx);
+}
+
 /// Submit a new request. Builds a Slot, queues it, returns the handle.
 /// Blocks if the queue is full (i.e. `in_flight >= queue_cap`). When
 /// the scheduler is shutting down this returns `error.Shutdown`.
@@ -525,6 +534,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
         self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
     }
     if (self.shutdown.load(.acquire)) return error.Shutdown;
+    if (clientGoneWhileQueued(&params)) {
+        log.info("  [cancel] client gone while queued (queue space) - dropping request before slot claim\n", .{});
+        return error.ClientGone;
+    }
 
     // An engine beside MLX serves as many requests at once as it has sessions (ds4's one, a llama.cpp
     // sequence, a Neural Engine slot), each reusing its KV across requests. Block here until one is free,
@@ -534,6 +547,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
             self.session_cond.waitUncancelable(self.io, &self.queue_mu);
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
+        if (clientGoneWhileQueued(&params)) {
+            log.info("  [cancel] client gone while queued (engine session) - dropping request before session claim\n", .{});
+            return error.ClientGone;
+        }
         params.model.session_claims += 1;
         slot.holds_session = true;
     }
