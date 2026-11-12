@@ -1108,6 +1108,8 @@ test "ds4 adapter: an image's placeholder becomes a run of the tower's rows, syn
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try visionGguf(&tmp, &buf);
+    // The contract holds on the model the engine serves images for: no media_rows, the atom route.
+    try contract.run(&Fake.table, .{ .model_dir = path, .model_type = "gguf", .config_json = "", .prompt = &.{ 5, 6, 7 }, .settings_json = "{\"prefill_chunk\":1}", .gate_ms = 500 });
     var host: abi.Host = .{ .ctx = undefined, .log = struct {
         fn f(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
     }.f, .wake = struct {
@@ -1165,12 +1167,40 @@ test "ds4 adapter: an image's placeholder becomes a run of the tower's rows, syn
     try testing.expectEqual(@as(u32, 0), Fake.state(e).image_cache.images.count());
 }
 
+test "ds4 adapter: an image whose rows overflow the context fails the request by name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try visionGguf(&tmp, &buf);
+    var host: abi.Host = .{ .ctx = undefined, .log = undefined, .wake = undefined };
+    // Six tokens of context (the fake clamps only an unset one, so this is honored): the raw
+    // prompt's five fit, the image widens it to seven — the overflow is the expansion's alone.
+    const o: abi.Open = .{ .model_dir = abi.span(u8, path), .model_type = .{}, .config_json = .{}, .context = 6, .max_concurrent = 1, .memory_budget = 0, .settings_json = abi.span(u8, "{\"prefill_chunk\":1}"), .options_json = .{}, .host = &host };
+    var info: abi.Info = undefined;
+    var v: abi.Verdict = .{};
+    const e = Fake.table.open(&o, &info, &v) orelse return error.Open;
+    defer Fake.table.close(e);
+    const rgb: [12]u8 = @splat(0);
+    const media = [_]abi.Media{.{ .kind = .image, .at = 0, .width = 2, .height = 2, .data = abi.span(u8, &rgb), .hash = 7 }};
+    const prompt = [_]u32{ 5, 900, 901, 902, 6 };
+    var c: Collect = .{};
+    defer c.deinit();
+    const req: abi.Request = .{ .prompt = abi.span(u32, &prompt), .media = abi.span(abi.Media, &media), .max_tokens = 1, .sampling = .{ .temperature = 0 } };
+    if (Fake.table.submit(e, 1, &req, c.sink()).code != .ok) return error.Refused;
+    c.wait();
+    try testing.expectEqual(Reason.failed, c.reason);
+    try testing.expectEqualStrings("ContextExceeded", c.why);
+    try testing.expectEqual(@as(usize, 0), c.toks.items.len);
+}
+
 const Collect = struct {
     toks: std.ArrayList(u32) = .empty,
     eos: std.ArrayList(u32) = .empty,
     lps: std.ArrayList(struct { token: u32, logprob: f32, top_len: usize, top_token: u32 }) = .empty,
     done: std.atomic.Value(bool) = .init(false),
     reason: Reason = .stop,
+    /// The name a failed request gives; `Verdict.why` is static text (@errorName), safe to borrow past the event.
+    why: []const u8 = "",
     prompt_tokens: u32 = 0,
     cached: u32 = 0,
     rounds: u64 = 0,
@@ -1189,6 +1219,7 @@ const Collect = struct {
         if (ev.kind == .finished) {
             if (ev.stats) |stats| c.rounds = stats.rounds;
             c.reason = ev.reason;
+            c.why = abi.items(u8, ev.verdict.why);
             c.done.store(true, .release);
         }
         return .go;
