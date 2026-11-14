@@ -30,6 +30,7 @@ test {
 /// other id 0) and it samples their argmax, so a shaped row changes what comes out; an MTP round accepts every draft.
 const FakeBridge = struct {
     pub const vocab = 1024;
+    pub const Error = bridge.Error;
     pub const Sampling = struct { temperature: f32, top_k: i32 = 0, top_p: f32 = 1, min_p: f32 = 0 };
     pub const Image = struct { at: u32, width: u32, height: u32, pixels: []const u8 };
     pub const LlamaEngine = struct {
@@ -338,6 +339,29 @@ test "llama adapter: a sidecar enables image atoms, distinct pixels miss cache a
     try testing.expectEqualSlices(u32, &.{103}, c.toks.items);
 }
 
+test "llama adapter: tokenize keeps BOS across a leading media atom and stable atom ids" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try llamaGguf(&tmp, &buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj-m.gguf", .data = "GGUF" });
+    var info: abi.Info = undefined;
+    const e = try openFake(path, "{\"seqs\":1}", &info);
+    defer Fake.table.close(e);
+    var ids: [24]u32 = undefined;
+    // The atom at the front must not swallow BOS: it lands before any text id.
+    var n = Fake.table.tokenize.?(e, abi.span(u8, "<__media__>abc"), true, &ids, ids.len);
+    try testing.expect(n > 12);
+    try testing.expectEqual(@as(u32, 1), ids[0]); // BOS
+    try testing.expectEqual(@as(u32, '<'), ids[1]); // the atom's first id
+    // A trailing atom after text: BOS once, atom ids identical both times.
+    n = Fake.table.tokenize.?(e, abi.span(u8, "hi<__media__>"), true, &ids, ids.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 'h', 'i', '<', '_', '_', 'm', 'e', 'd', 'i', 'a', '_', '_', '>' }, ids[0..n]);
+    // No atom: the plain path keeps its exact shape.
+    n = Fake.table.tokenize.?(e, abi.span(u8, "abc"), true, &ids, ids.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 'a', 'b', 'c' }, ids[0..n]);
+}
+
 // ── against a real GGUF (`MLX_SERVE_TEST_LLAMA_GGUF`; skipped without it)
 
 fn realGguf() ?[]const u8 {
@@ -393,4 +417,56 @@ test "llama adapter: greedy tokens equal the plain bridge sequence on a real GGU
     if (R.table.submit(e, 1, &.{ .prompt = abi.span(u32, ids.items), .max_tokens = n, .sampling = .{ .temperature = 0 }, .eos = info.eos }, got.sink()).code != .ok) return error.Refused;
     got.wait();
     try testing.expectEqualSlices(u32, want.items, got.toks.items);
+}
+
+// ── against a real GGUF with its mmproj (`MLX_SERVE_TEST_LLAMA_MMPROJ`; skipped without it)
+
+fn realMmprojGguf() ?[]const u8 {
+    const raw = env.get(.MLX_SERVE_TEST_LLAMA_MMPROJ) orelse return null;
+    const s = std.mem.sliceTo(raw, 0);
+    return if (s.len == 0) null else s;
+}
+
+test "llama adapter: the real bridge expands an image and refuses one past the context" {
+    if (!build_options.llama_engine) return error.SkipZigTest;
+    const path = realMmprojGguf() orelse return error.SkipZigTest;
+    const gguf_files = @import("../../sdk/quant/gguf/files.zig");
+    const mmproj = gguf_files.findVisionSidecar(io, testing.allocator, path) orelse return error.SkipZigTest;
+    defer testing.allocator.free(mmproj);
+
+    const eng = try bridge.LlamaEngine.open(testing.allocator, path, .{});
+    defer eng.close();
+    try eng.attachVision(mmproj);
+    try testing.expect(eng.hasVision());
+
+    const marker = try eng.tokenizeText(testing.allocator, eng.imageMarker(), false);
+    defer testing.allocator.free(marker);
+    const pre = try eng.tokenizeText(testing.allocator, "Describe this:", false);
+    defer testing.allocator.free(pre);
+    const post = try eng.tokenizeText(testing.allocator, " in one word.", false);
+    defer testing.allocator.free(post);
+    var prompt: std.ArrayList(i32) = .empty;
+    defer prompt.deinit(testing.allocator);
+    try prompt.appendSlice(testing.allocator, pre);
+    const at: u32 = @intCast(prompt.items.len);
+    try prompt.appendSlice(testing.allocator, marker);
+    try prompt.appendSlice(testing.allocator, post);
+
+    var ctx = try eng.createContext(.{ .ctx_size = 4096, .n_seq = 1 });
+    defer ctx.free();
+    const seq = &ctx.seqs[0];
+
+    const pixels = try testing.allocator.alloc(u8, 64 * 64 * 3);
+    defer testing.allocator.free(pixels);
+    for (pixels, 0..) |*px, i| px.* = if (i % 3 == 0) 255 else 0; // solid red
+    const images = [_]bridge.Image{.{ .at = at, .width = 64, .height = 64, .pixels = pixels }};
+    var cancel = std.atomic.Value(bool).init(false);
+    const expanded = try seq.syncImages(prompt.items, &images, marker, &cancel, 64);
+    try testing.expect(expanded > prompt.items.len); // the image took KV cells
+    var rng: u64 = 0;
+    try testing.expect(seq.sample(.{ .temperature = 0 }, &rng) >= 0);
+
+    // The same pixels sync again (cold), and a reply past the context is refused by name.
+    _ = try seq.syncImages(prompt.items, &images, marker, &cancel, 64);
+    try testing.expectError(bridge.Error.MediaRefused, seq.syncImages(prompt.items, &images, marker, &cancel, std.math.maxInt(u32)));
 }

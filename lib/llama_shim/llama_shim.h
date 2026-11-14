@@ -164,9 +164,12 @@ typedef struct {
 // patches). `max_tokens` is the generation the caller intends: the prompt
 // and the generation must fit the sequence's context.
 //
-// `cancelled` is polled between the images; when it returns true the prompt
-// is abandoned and the sequence is left cleared. 0 ok, -1 on failure (`err`
-// filled; the sequence is left cleared).
+// `cancelled` is polled between the images and between the text decode's
+// chunks; when it returns true the prompt is abandoned and the sequence is
+// left cleared. 0 ok, -1 on failure (`err` filled; the sequence is left
+// cleared), -2 a refusal the caller can fix: `err` names it (the expanded
+// prompt plus the reply does not fit the context, or a non-causal projector
+// needs an image inside one ubatch).
 int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
                                   const int32_t *prompt, int32_t n_prompt,
                                   const mlx_llama_image *images, int32_t n_images,

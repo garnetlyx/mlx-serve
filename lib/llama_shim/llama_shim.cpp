@@ -64,7 +64,8 @@ struct mlx_llama_ctx {
     struct llama_batch_ext *batch;
     struct llama_batch_ext *dbatch;
     int32_t n_seq;
-    int32_t n_batch;
+    int32_t n_batch;   // logical decode batch (prompt chunks)
+    int32_t n_ubatch;  // physical batch: one llama_process call never holds more rows
     int32_t n_vocab;
     int32_t mtp_drafts;
     size_t n_embd_h;              // width of a NextN hidden row
@@ -122,6 +123,7 @@ static void copy_err(char *err, size_t errlen, const char *msg) {
 // A formatted message: the diagnostics name the image or the token a failure
 // is about.
 static void format_msg(char *buf, size_t buflen, const char *fmt, ...) {
+    if (!buf || buflen == 0) return;
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, buflen, fmt, ap);
@@ -210,6 +212,7 @@ int32_t mlx_llama_attach_vision(mlx_llama_engine *e, const char *mmproj_path, ch
     mp.device = nullptr;
     mp.media_marker = mtmd_default_marker();
     mp.image_marker = NULL; // deprecated: mtmd refuses a custom one
+    mp.print_timings = false; // one load line is enough, not a timing dump per image
     struct mtmd_context *m = mtmd_init_from_file(mmproj_path, e->model, mp);
     if (!m) {
         copy_err(err, errlen, "mtmd_init_from_file failed: the projector does not match the model");
@@ -225,7 +228,7 @@ bool mlx_llama_has_vision(mlx_llama_engine *e) {
 }
 
 const char *mlx_llama_media_marker(mlx_llama_engine *e) {
-    (void)e;
+    if (e && e->mtmd) return mtmd_get_marker(e->mtmd);
     return mtmd_default_marker();
 }
 
@@ -347,6 +350,7 @@ extern "C" mlx_llama_ctx *mlx_llama_ctx_create(mlx_llama_engine *e, const mlx_ll
     c->dbatch = NULL;
     c->n_seq = n_seq;
     c->n_batch = (int32_t)llama_n_batch(tgt);
+    c->n_ubatch = (int32_t)llama_n_ubatch(tgt);
     c->n_vocab = llama_vocab_n_tokens(e->vocab);
     c->mtp_drafts = 0;
     c->n_embd_h = 0;
@@ -488,9 +492,11 @@ extern "C" int32_t mlx_llama_seq_prefill(mlx_llama_ctx *c, int32_t seq, const in
 // Decode `n` tokens into `seq` at the positions [p0, p0+n); advances *p0.
 // The last token of the last chunk gets the logits when `logits_last`.
 static int32_t media_decode_text(mlx_llama_ctx *c, int32_t seq, const int32_t *tokens, int32_t n,
-                                 llama_pos *p0, bool logits_last) {
+                                 llama_pos *p0, bool logits_last,
+                                 bool (*cancelled)(void *), void *cancel_ud) {
     int32_t off = 0;
     while (off < n) {
+        if (cancelled && cancelled(cancel_ud)) return -1;
         const int32_t m = std::min(n - off, c->n_batch);
         c->rows.resize((size_t)m);
         for (int32_t i = 0; i < m; i++) c->rows[i] = { tokens[off + i], *p0 + i, seq };
@@ -532,48 +538,51 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
     }
     MediaPlan plan;
     char msg[256];
-    auto fail = [&](const char *m) -> int32_t {
+    // -1 the engine failed; -2 the caller can fix what `err` names (prompt size, ubatch).
+    auto fail = [&](const char *m, int32_t rc) -> int32_t {
         plan.clear();
         seq_clear(c, seq);
         copy_err(err, errlen, m);
-        return -1;
+        return rc;
     };
-
+    auto die = [&](const char *m) -> int32_t { return fail(m, -1); };
+    auto refuse = [&](const char *m) -> int32_t { return fail(m, -2); };
+    try {
     if (!c->e->mtmd) {
-        return fail("no vision projector is attached");
+        return die("no vision projector is attached");
     }
     if (!mtmd_support_vision(c->e->mtmd)) {
-        return fail("the attached projector does not take images");
+        return die("the attached projector does not take images");
     }
     if (!prompt || n_prompt <= 0) {
-        return fail("the prompt is empty");
+        return die("the prompt is empty");
     }
     if (!images || n_images <= 0) {
-        return fail("the prompt carries no image");
+        return die("the prompt carries no image");
     }
     if (!marker || n_marker <= 0) {
-        return fail("the media marker is empty");
+        return die("the media marker is empty");
     }
     for (int32_t i = 0; i < n_images; i++) {
         if (images[i].at < 0 || (int64_t)images[i].at + n_marker > (int64_t)n_prompt) {
             format_msg(msg, sizeof msg, "the image %d sits outside the prompt", i);
-            return fail(msg);
+            return die(msg);
         }
         if (i > 0 && (int64_t)images[i].at < (int64_t)images[i - 1].at + n_marker) {
             format_msg(msg, sizeof msg, "the images %d and %d overlap", i - 1, i);
-            return fail(msg);
+            return die(msg);
         }
         // The image owns the marker run at its place: the prompt's tokens there
         // are the marker, not text.
         for (int32_t k = 0; k < n_marker; k++) {
             if (prompt[images[i].at + k] != marker[k]) {
                 format_msg(msg, sizeof msg, "the image %d does not sit at its media marker", i);
-                return fail(msg);
+                return die(msg);
             }
         }
         if (images[i].width == 0 || images[i].height == 0 || !images[i].pixels) {
             format_msg(msg, sizeof msg, "the image %d has no pixels", i);
-            return fail(msg);
+            return die(msg);
         }
     }
 
@@ -585,19 +594,23 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
     text.text_len = strlen(marker_str);
     text.add_special = false;  // the prompt's own tokens carry the specials
     text.parse_special = true; // the model's vision tokens are special tokens
-    uint32_t expanded = 0;
+    // A non-causal projector attends across the whole image in ONE batch:
+    // llama.cpp asserts (aborts) when such a decode exceeds n_ubatch, so an
+    // image past it is refused by name instead of killing the process.
+    const bool non_causal = mtmd_decode_use_non_causal(c->e->mtmd, NULL);
+    int64_t expanded = 0;
     for (int32_t i = 0; i < n_images; i++) {
         if (cancelled && cancelled(cancel_ud)) {
-            return fail("cancelled");
+            return die("cancelled");
         }
         mtmd_bitmap *bm = mtmd_bitmap_init(images[i].width, images[i].height, images[i].pixels);
         if (!bm) {
-            return fail("out of memory allocating the image");
+            return die("out of memory allocating the image");
         }
         mtmd_input_chunks *chunks = mtmd_input_chunks_init();
         if (!chunks) {
             mtmd_bitmap_free(bm);
-            return fail("out of memory allocating the image chunks");
+            return die("out of memory allocating the image chunks");
         }
         const mtmd_bitmap *bitmaps[1] = { bm };
         const int32_t rc = mtmd_tokenize(c->e->mtmd, chunks, &text, bitmaps, 1);
@@ -606,27 +619,49 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
             mtmd_input_chunks_free(chunks);
             char buf[192];
             snprintf(buf, sizeof buf, "the image %d does not fit the projector (marker or preprocessing error)", i);
-            return fail(buf);
+            return die(buf);
+        }
+        if (non_causal) {
+            const int64_t ntok = (int64_t)mtmd_helper_get_n_tokens(chunks);
+            if (ntok > (int64_t)c->n_ubatch) {
+                mtmd_input_chunks_free(chunks);
+                char buf[224];
+                snprintf(buf, sizeof buf,
+                         "the image %d expands to %lld vision tokens; its projector attends across them in one batch,"
+                         " so raise --llama-ubatch past %d or send a smaller image",
+                         i, (long long)ntok, c->n_ubatch);
+                return refuse(buf);
+            }
         }
         plan.chunks.push_back(chunks);
-        expanded += (uint32_t)mtmd_helper_get_n_tokens(chunks);
+        expanded += (int64_t)mtmd_helper_get_n_tokens(chunks);
     }
 
     // The text tokens around the images count towards the prompt too.
     int32_t seg = 0;
     for (int32_t i = 0; i < n_images; i++) {
-        expanded += (uint32_t)(images[i].at - seg);
+        expanded += (int64_t)(images[i].at - seg);
         seg = images[i].at + n_marker;
     }
-    expanded += (uint32_t)(n_prompt - seg);
+    expanded += (int64_t)(n_prompt - seg);
+    // No marker may survive past the last image: the bridge pairs them one to
+    // one, but this is a public entry point and a leftover marker would decode
+    // as literal text instead of failing.
+    for (int32_t pos = seg; pos + n_marker <= n_prompt; pos++) {
+        bool run = true;
+        for (int32_t k = 0; k < n_marker; k++) run = run && prompt[pos + k] == marker[k];
+        if (run) {
+            return die("the prompt holds a media marker no image owns");
+        }
+    }
 
     const int64_t n_ctx_seq = (int64_t)llama_n_ctx_seq(c->tgt);
-    if ((int64_t)expanded + (int64_t)max_tokens > n_ctx_seq) {
+    if (expanded + (int64_t)max_tokens > n_ctx_seq) {
         char buf[224];
         snprintf(buf, sizeof buf,
-                 "the expanded prompt (%u tokens) plus the requested %u tokens does not fit the context (%lld)",
-                 expanded, max_tokens, (long long)n_ctx_seq);
-        return fail(buf);
+                 "the expanded prompt (%lld tokens) plus the requested %u tokens does not fit the context (%lld)",
+                 (long long)expanded, max_tokens, (long long)n_ctx_seq);
+        return refuse(buf);
     }
 
     // Cold prefill: the sequence starts empty, so no KV of an earlier request
@@ -639,20 +674,23 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
     seg = 0;
     for (int32_t i = 0; i < n_images; i++) {
         const int32_t n_text = images[i].at - seg;
-        if (media_decode_text(c, seq, prompt + seg, n_text, &p, false) != 0) {
-            return fail("llama_process failed during the media prefill");
+        if (media_decode_text(c, seq, prompt + seg, n_text, &p, false, cancelled, cancel_ud) != 0) {
+            if (cancelled && cancelled(cancel_ud)) return die("cancelled");
+            return die("llama_process failed during the media prefill");
         }
         if (cancelled && cancelled(cancel_ud)) {
-            return fail("cancelled");
+            return die("cancelled");
         }
         // The projector encodes the image and the model reads its embeddings.
         // The helper reports the position it reached: for M-RoPE models that is
-        // not the token count but the position the next token sits at.
+        // not the token count but the position the next token sits at. One
+        // helper batch never exceeds the context's physical ubatch: a
+        // non-causal projector's image decode aborts the process past it.
         llama_pos p_new = p;
         const int32_t rc = mtmd_helper_eval_chunks(c->e->mtmd, c->tgt, plan.chunks[(size_t)i], p, seq,
-                                                   c->n_batch, false, &p_new);
+                                                   std::min(c->n_batch, c->n_ubatch), false, &p_new);
         if (rc != 0) {
-            return fail("mtmd_helper_eval_chunks failed");
+            return die("mtmd_helper_eval_chunks failed");
         }
         p = p_new;
         c->pos[seq] = p;
@@ -663,17 +701,21 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
 
     const int32_t n_tail = n_prompt - seg;
     if (n_tail <= 0) {
-        return fail("the prompt ends with an image: there is no token to draw the next one from");
+        return die("the prompt ends with an image: there is no token to draw the next one from");
     }
-    if (media_decode_text(c, seq, prompt + seg, n_tail, &p, true) != 0) {
-        return fail("llama_process failed during the media prefill");
+    if (media_decode_text(c, seq, prompt + seg, n_tail, &p, true, cancelled, cancel_ud) != 0) {
+        if (cancelled && cancelled(cancel_ud)) return die("cancelled");
+        return die("llama_process failed during the media prefill");
     }
     c->pos[seq] = p;
     // The last decode's last row holds the logits the caller samples from.
     c->out_idx[seq] = -2;
-    if (out_expanded) *out_expanded = expanded;
+    if (out_expanded) *out_expanded = (uint32_t)expanded;
     plan.clear();
     return 0;
+    } catch (const std::bad_alloc &) {
+        return die("out of memory building the media prompt");
+    }
 }
 
 extern "C" int32_t mlx_llama_step(mlx_llama_ctx *c, const int32_t *seqs, const int32_t *tokens, int32_t n,

@@ -33,6 +33,7 @@ pub const Error = error{
     TokenizeFailed,
     VisionAttachFailed,
     MediaSyncFailed,
+    MediaRefused,
     OutOfMemory,
 };
 
@@ -546,7 +547,7 @@ pub const LlamaSeq = struct {
             log.err("[llama] media prefill failed: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
             // The shim left the sequence cleared; the mirror follows it.
             self.reset();
-            return Error.MediaSyncFailed;
+            return if (rc == -2) Error.MediaRefused else Error.MediaSyncFailed;
         }
         self.has_media = true;
         return expanded;
@@ -782,9 +783,9 @@ test "llama: a multimodal prompt's markers and images must match one to one" {
 }
 
 test "llama: a single-token media marker is found in the prompt" {
-    const marker = [_]i32{ 77 };
+    const marker = [_]i32{77};
     const prompt = [_]i32{ 1, 77, 2, 77, 3 };
-    const pixels = [_]u8{ 9, 9, 9};
+    const pixels = [_]u8{ 9, 9, 9 };
     const one = [_]Image{.{ .at = 1, .width = 1, .height = 1, .pixels = &pixels }};
     try std.testing.expectError(error.MarkerOrphan, validateMedia(&prompt, one[0..], &marker));
     const two = [_]Image{

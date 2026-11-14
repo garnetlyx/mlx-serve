@@ -33,7 +33,10 @@ pub fn open(comptime bridge: type, io: std.Io, gpa: std.mem.Allocator, path: []c
     defer if (vision) |p| gpa.free(p);
     if (vision) |p| {
         log.info("[llama] vision projector: {s}\n", .{p});
-        try engine.attachVision(p);
+        // A projector that does not attach costs the images, never the model —
+        // the same policy as a failed MTP head. A stray or mismatched mmproj
+        // beside the GGUF must not brick a working text model.
+        engine.attachVision(p) catch log.warn("[llama] vision projector did not attach; serving text-only: {s}\n", .{p});
     }
     log.info("[llama] engine ready (EOS={d}, n_vocab={d}, vision={})\n", .{ engine.eosToken(), engine.nVocab(), engine.hasVision() });
 

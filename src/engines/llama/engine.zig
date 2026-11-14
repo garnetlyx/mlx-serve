@@ -270,17 +270,19 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             var ids: std.ArrayList(i32) = .empty;
             errdefer ids.deinit(gpa);
             var rest = text;
-            var first = true;
+            // BOS rides the first part that tokenizes to something: an atom at
+            // the very front would otherwise swallow the only add_special call.
+            var bos_pending = specials;
             while (true) {
                 const at = std.mem.indexOf(u8, rest, st.engine.imageMarker()) orelse rest.len;
-                const part = try st.engine.tokenizeText(gpa, rest[0..at], specials and first);
+                const part = try st.engine.tokenizeText(gpa, rest[0..at], bos_pending);
                 defer gpa.free(part);
+                if (part.len > 0) bos_pending = false;
                 try ids.appendSlice(gpa, part);
                 if (at == rest.len) break;
                 // Keep atoms stable across adjacent text: BPE must not merge across an image boundary.
                 try ids.appendSlice(gpa, st.image_marker);
                 rest = rest[at + st.engine.imageMarker().len ..];
-                first = false;
             }
             return ids.toOwnedSlice(gpa);
         }
@@ -345,6 +347,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 for (r.media, images) |m, *image| image.* = .{ .at = m.at, .width = m.width, .height = m.height, .pixels = m.data.slice() };
                 r.prompt_tokens = seq.syncImages(prompt, images, st.image_marker, &r.cancelled, r.max_tokens) catch |err| {
                     seq.reset();
+                    if (err == B.Error.MediaRefused) return end(st, &l, .failed, "the image prompt does not fit this model: reduce the image size or max_tokens (a non-causal projector may need a larger --llama-ubatch; the server log names the exact refusal)");
                     return end(st, &l, if (r.isCancelled()) .cancelled else .failed, @errorName(err));
                 };
                 break :blk 0;
