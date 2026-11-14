@@ -5,6 +5,7 @@ const std = @import("std");
 const model_discovery = @import("../../host/registry/discovery.zig");
 const log = @import("../../sdk/util/log.zig");
 const ffi = @import("ffi.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 
 /// Sequences one context holds at most.
 pub const max_seqs = 64;
@@ -28,7 +29,13 @@ pub fn open(comptime bridge: type, io: std.Io, gpa: std.mem.Allocator, path: []c
         .load_mtp = s.mtp_drafts > 0,
     });
     errdefer engine.close();
-    log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
+    const vision = gguf_files.findVisionSidecar(io, gpa, path);
+    defer if (vision) |p| gpa.free(p);
+    if (vision) |p| {
+        log.info("[llama] vision projector: {s}\n", .{p});
+        try engine.attachVision(p);
+    }
+    log.info("[llama] engine ready (EOS={d}, n_vocab={d}, vision={})\n", .{ engine.eosToken(), engine.nVocab(), engine.hasVision() });
 
     const ctx = try engine.createContext(.{
         .ctx_size = @intCast(ctx_size),
