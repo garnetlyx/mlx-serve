@@ -2049,12 +2049,15 @@ fn runGgufServe(
     };
     defer allocator.free(gguf_path);
     const model_ctx = settings.ctx_size orelse ctx_size;
+    // The startup model takes the same rule as an on-demand load: an unnamed context threads
+    // a llama GGUF's own trained window, never the engine fallback.
+    const ask_ctx = if (model_ctx == 0 and engine == .llama) cpu_state_mod.ggufTrainedContext(io, allocator, gguf_path) else model_ctx;
 
     log.info("mlx-serve {s} ({s} engine, GGUF backend)\n", .{ VERSION, if (engine == .ds4) "ds4" else "llama.cpp" });
     log.info("[args] model: {s}\n", .{gguf_path});
     log.info("[args] serve: {s}:{d}, ctx-size={d}\n", .{ host, port, model_ctx });
 
-    var stub = try cpu_state_mod.buildGgufStubCpuState(allocator, engine, model_ctx);
+    var stub = try cpu_state_mod.buildGgufStubCpuState(allocator, engine, ask_ctx);
     var stub_owned_by_registry = false;
     errdefer if (!stub_owned_by_registry) cpu_state_mod.freeCpuState(allocator, &stub);
     stub.config.ctx_override = settings.ctx_size orelse 0;

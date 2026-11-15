@@ -146,9 +146,20 @@ fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
     errdefer allocator.free(gguf_path);
 
     const engine = served.ggufEngine(io, allocator, gguf_path, forced);
-    var state = try buildGgufStubCpuState(allocator, engine, ctx_size);
+    // Nobody named a context: a llama.cpp GGUF's ask is its own trained window. Without this the
+    // engine's fallback (8192) silently caps a model whose header declares far more — the
+    // metadata is display-only (`api/models.zig ggufContextCap`). ds4 sizes its own session.
+    const ctx = if (ctx_size == 0 and engine == .llama) ggufTrainedContext(io, allocator, gguf_path) else ctx_size;
+    var state = try buildGgufStubCpuState(allocator, engine, ctx);
     state.gguf = .{ .path = gguf_path, .engine = engine, .disk_only_bytes = if (engine == .ds4) gguf_meta.ds4DiskOnlyBytes(io, allocator, gguf_path) else 0 };
     return state;
+}
+
+/// A GGUF's `<arch>.context_length` — the window its checkpoint was trained for; 0 when absent.
+pub fn ggufTrainedContext(io: std.Io, allocator: std.mem.Allocator, gguf_path: []const u8) u32 {
+    var info = gguf_meta.readFromFile(io, allocator, gguf_path) catch return 0;
+    defer info.deinit(allocator);
+    return info.context_length;
 }
 
 /// Stub CPU state for a GGUF: the engine owns the real tokenizer and template (llama.cpp's is adopted at load), so
@@ -222,4 +233,30 @@ test "buildGgufStubCpuState: the stub names its engine's model_type and carries 
     defer freeCpuState(a, &d);
     try std.testing.expectEqualStrings("deepseek_v4", d.config.model_type);
     try std.testing.expectEqual(@as(u32, 4096), d.config.max_position_embeddings);
+}
+
+test "preloadGgufCpuState: nobody naming a context threads a llama GGUF's own trained window" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = try gguf_meta.buildHeader(a, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "qwen35" } },
+        .{ .key = "qwen35.context_length", .value = .{ .u32_v = 131072 } },
+    });
+    defer a.free(header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.gguf", .data = header });
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = root[0..try tmp.dir.realPath(io, &root)];
+
+    var state = try preloadGgufCpuState(a, io, dir, 0, null);
+    defer freeCpuState(a, &state);
+    defer a.free(state.gguf.?.path);
+    try std.testing.expectEqual(gguf_meta.Engine.llama, state.gguf.?.engine);
+    try std.testing.expectEqual(@as(u32, 131072), state.config.max_position_embeddings);
+
+    var named = try preloadGgufCpuState(a, io, dir, 4096, null);
+    defer freeCpuState(a, &named);
+    defer a.free(named.gguf.?.path);
+    try std.testing.expectEqual(@as(u32, 4096), named.config.max_position_embeddings); // an explicit ask wins
 }
