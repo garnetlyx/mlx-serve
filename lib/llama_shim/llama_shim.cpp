@@ -656,12 +656,22 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
     }
 
     const int64_t n_ctx_seq = (int64_t)llama_n_ctx_seq(c->tgt);
-    if (expanded + (int64_t)max_tokens > n_ctx_seq) {
+    if (expanded >= n_ctx_seq) {
         char buf[224];
         snprintf(buf, sizeof buf,
-                 "the expanded prompt (%lld tokens) plus the requested %u tokens does not fit the context (%lld)",
-                 (long long)expanded, max_tokens, (long long)n_ctx_seq);
+                 "the expanded prompt (%lld tokens) alone exceeds the context (%lld)",
+                 (long long)expanded, (long long)n_ctx_seq);
         return refuse(buf);
+    }
+    // Clamp the ask to what actually fits. The server's own auto budget is computed
+    // before the image expansion (and a client may over-ask); the prompt itself fits,
+    // so the answer is a shorter budget, never a failed request. Generation stops at
+    // the clamp exactly as an explicit max_tokens would.
+    if (expanded + (int64_t)max_tokens > n_ctx_seq) {
+        const uint32_t clamped = (uint32_t)(n_ctx_seq - expanded);
+        fprintf(stderr, "[llama] media budget clamped: max_tokens %u -> %u (prompt %lld, ctx %lld)\n",
+                max_tokens, clamped, (long long)expanded, (long long)n_ctx_seq);
+        max_tokens = clamped;
     }
 
     // Cold prefill: the sequence starts empty, so no KV of an earlier request

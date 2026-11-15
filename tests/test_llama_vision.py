@@ -337,6 +337,21 @@ def case_usage(client, images):
                           f"image={img_tokens} baseline={base_tokens}")
 
 
+def case_budget_fill(client, images):
+    """A client (or the server's own auto budget) may ask for more generation
+    than remains once the image expands. The prompt fits, so the answer is a
+    clamped budget — never a failed request."""
+    models = client.request("/v1/models")["data"]
+    ctx = next((m.get("context_length") or 8192 for m in models if m.get("id") == ARGS.model), 8192)
+    filler = "Please look at the image and answer. " * 8
+    resp = client.chat(image_content(images["red"], filler + COLOR_PROMPT), max_tokens=ctx)
+    text = chat_text(resp)
+    if "red" in text.lower():
+        client.report.ok("window-filling budget clamped, not refused", f"answered: {text.strip()[:60]!r}")
+    else:
+        client.report.bad("window-filling budget clamped, not refused", f"unexpected answer: {text[:80]!r}")
+
+
 def case_malformed(client, images):
     bad_content = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,@@not-valid-base64@@"}},
                    {"type": "text", "text": COLOR_PROMPT}]
@@ -365,6 +380,7 @@ CASES = [
     ("text_after_image", case_text_after_image),
     ("anthropic", case_anthropic),
     ("usage", case_usage),
+    ("budget_fill", case_budget_fill),
     ("malformed", case_malformed),
 ]
 
