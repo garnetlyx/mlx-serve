@@ -73,11 +73,17 @@ T0=$(echo "$BODY" | J 'd["choices"][0]["message"]["content"]')
 [[ -n "$GREEDY" && "$GREEDY" == "$T0" ]] && ok "top_p 0 is greedy (== temperature 0)" || bad "top_p 0 is greedy" "top_p0='$GREEDY' temp0='$T0'"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"top_k\":1,\"temperature\":1.0,\"max_tokens\":8}"
 [[ "$(echo "$BODY" | J 'd["choices"][0]["message"]["content"]')" == "$T0" ]] && ok "top_k 1 is greedy" || bad "top_k 1 is greedy"
-for f in '"temperature":-1' '"temperature":100' '"top_p":2' '"top_k":-3' '"seed":9223372036854775808' '"seed":"abc"' '"max_tokens":0' '"max_tokens":-5' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":2'; do
+for f in '"temperature":-1' '"temperature":100' '"top_p":2' '"top_k":-3' '"seed":9223372036854775808' '"seed":"abc"' '"max_tokens":0' '"max_tokens":-5' '"presence_penalty":2,"frequency_penalty":2'; do
     [[ "$f" == '"max_tokens"'* ]] && cap="" || cap=',"max_tokens":5'
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f$cap}"
     [[ "$R" == 200 && -n "$(echo "$BODY" | J 'd["choices"][0]["message"]["content"]')" ]] && ok "out-of-range $f answers" || bad "out-of-range $f" "$R $(echo "$BODY" | head -c 120)"
 done
+
+# logit_bias left the out-of-range loop on purpose: #1112 made the MLX path refuse it by
+# name (the engine-side range clamp still holds where it is served). Upstream's loop entry
+# predates that refusal and answers 400 today; assert the named contract instead.
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"logit_bias\":{\"1\":-100},\"max_tokens\":5}"
+[[ "$R" == 400 && "$BODY" == *"does not serve logit_bias"* ]] && ok "logit_bias on MLX refuses by name" || bad "logit_bias on MLX refusal" "$R $(echo "$BODY" | head -c 120)"
 
 echo "=== stop sequences ==="
 CNT='{"role":"user","content":"Count from one to ten in words, comma separated."}'
