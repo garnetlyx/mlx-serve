@@ -7,6 +7,7 @@ const std = @import("std");
 /// `last` for the message.
 pub const Known = error{
     Ds4EngineBusy,
+    ForeignBytesReaderBusy,
     ContextExceeded,
     MediaPlaceholderMismatch,
     EmptyPrompt,
@@ -68,6 +69,8 @@ test "err_name: a known name comes back as the same error; an unknown one keeps 
     try std.testing.expectEqual(error.PrefillDoesNotFit, toError("PrefillDoesNotFit"));
     // A load the GPU timed out on answers its own 503, not a generic 500.
     try std.testing.expectEqual(error.GpuTimeout, toError("GpuTimeout"));
+    try std.testing.expectEqual(error.ForeignBytesReaderBusy, toError("ForeignBytesReaderBusy"));
+    try std.testing.expectEqual(error.ForeignBytesReaderBusy, check("ForeignBytesReaderBusy"));
     try std.testing.expectEqual(error.EngineFailed, toError("InvalidQwen4Indexer"));
     // The engine's load tells a missing tower (vision off) from a failed load, across the module unit too.
     try std.testing.expectEqual(error.MissingVisionWeights, toError("MissingVisionWeights"));
