@@ -86,6 +86,11 @@ pub const LoadParams = struct {
     /// the decode path on the inference thread. Adds ~600-900 ms at boot but
     /// keeps the first user request fast.
     warmup_eager: bool = true,
+    /// `--no-warmup-eager` as launched, for the models loaded after startup (this load's own is `warmup_eager`).
+    launch_warmup_eager: bool = true,
+    /// `--warmup-full`: a build's first load of a model serves its whole warm plan before it reports ready
+    /// (`warm_requests.zig`), where the default leaves a short one for when the server is idle.
+    warmup_full: bool = false,
     /// Drafter block size (caller computed via `drafter.recommendedBlockSize`).
     /// Ignored when `drafter_dir` is empty.
     draft_block_size: u32 = 4,
@@ -210,6 +215,8 @@ pub const SubmitParams = struct {
     engine_media: []const abi.Media = &.{},
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
+    /// A prefix cache of the request's own, in place of the model's (a warm request leaves the model's untouched).
+    prefix_cache: ?*handles.HotPrefixCache = null,
     client: metrics_mod.Client = .other,
     /// Optional liveness probe for the submitting connection, evaluated when a
     /// blocked submit wakes (queue space freed or an engine session released).
@@ -219,6 +226,8 @@ pub const SubmitParams = struct {
     /// request wants and decode a response nobody will read.
     peer_closed: ?*const fn (*anyopaque) bool = null,
     peer_closed_ctx: ?*anyopaque = null,
+    /// The request's `X-MLX-Priority: high` (`Conn.priority`).
+    priority: bool = false,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.

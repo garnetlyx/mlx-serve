@@ -104,7 +104,8 @@ pub fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
 fn preloadTextCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !CpuState {
     const config = try allocator.create(ModelConfig);
     errdefer allocator.destroy(config);
-    config.* = try model_mod.parseConfig(io, allocator, model_dir);
+    // An engine plugin's model is never a built-in plugin's to refuse.
+    config.* = if (@import("../plugins/loader.zig").engineServes(model_dir)) try model_mod.parseConfigLegacy(io, allocator, model_dir) else try model_mod.parseConfig(io, allocator, model_dir);
 
     const tok = try allocator.create(Tokenizer);
     errdefer allocator.destroy(tok);
@@ -147,8 +148,9 @@ fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
 
     const engine = served.ggufEngine(io, allocator, gguf_path, forced);
     // Nobody named a context: a llama.cpp GGUF's ask is its own trained window. Without this the
-    // engine's fallback (8192) silently caps a model whose header declares far more — the
-    // metadata is display-only (`api/models.zig ggufContextCap`). ds4 sizes its own session.
+    // engine's fallback (8192) silently caps a model whose header declares far more — display is
+    // the effective pin-or-native pair (`api/models.zig advertisedStubContext`), while this stub
+    // bills the window a load would actually open at. ds4 sizes its own session.
     const ctx = if (ctx_size == 0 and engine == .llama) ggufTrainedContext(io, allocator, gguf_path) else ctx_size;
     var state = try buildGgufStubCpuState(allocator, engine, ctx);
     state.gguf = .{ .path = gguf_path, .engine = engine, .disk_only_bytes = if (engine == .ds4) gguf_meta.ds4DiskOnlyBytes(io, allocator, gguf_path) else 0 };

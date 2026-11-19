@@ -80,6 +80,7 @@ pub fn handle(
         .engine_media = engine_media,
         .cache_key = cache_key,
         .client = stream.client,
+        .priority = stream.priority,
         .ablation = stream.ablation,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,

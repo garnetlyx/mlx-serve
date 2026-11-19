@@ -13,6 +13,8 @@ const mlx_engine = @import("../engines/mlx.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
+const stubMeta = @import("../registry/stub_cache.zig").stubMeta;
+const model_settings_mod = @import("../registry/model_settings.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
@@ -31,6 +33,7 @@ const request_model = @import("request_model.zig");
 const row_facts = @import("model_row_facts.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
+const ALLOW_HEADERS = @import("../http/respond.zig").ALLOW_HEADERS;
 const configuredKvQuantFor = @import("../http/server.zig").configuredKvQuantFor;
 const parseModelFromBody = @import("request_model.zig").parseModelFromBody;
 const resolveRequestModelId = @import("request_model.zig").resolveRequestModelId;
@@ -55,6 +58,7 @@ const jsonEscape = @import("format.zig").jsonEscape;
 /// pack's EXL3 experts.
 fn modelEngineName(engine: ?EngineKind, mlx_gguf_served: bool, config: ?*const model_mod.ModelConfig, path: []const u8, arch_hint: []const u8) []const u8 {
     if (engine) |k| return @tagName(k);
+    if (@import("../plugins/loader.zig").engineServes(path)) return "plugin";
     if (config) |c| {
         if (c.exl3 != null) return "sushi";
     }
@@ -178,6 +182,13 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
 pub fn loadedSupportsVideo(entry: *const LoadedModel) bool {
     if (entry.engine) |e| return e.caps().video;
     return mlx_engine.api().supports_video(entry);
+}
+
+/// The context an unloaded stub advertises: the one a load will serve it at
+/// (`http/server.zig manualContextFor`: the `model-settings.json` pin, else
+/// `--ctx-size`), else the pack's architectural max.
+fn advertisedStubContext(native: u32, manual: u32) u32 {
+    return if (manual > 0) manual else native;
 }
 
 /// pulls full capabilities/dimensions off the resident config/chat_config;
@@ -313,7 +324,7 @@ pub fn renderModelEntry(
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
-            if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
+            if (mtp_loaded or stubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
             if (config.rowExactDecode()) "true" else "false",
             configuredKvQuantFor(config).wireName(),
             gen_temp_str,
@@ -347,8 +358,7 @@ pub fn renderModelEntry(
     defer if (err_part.len > 0) allocator.free(err_part);
     // Stub metadata sourced from config.json (+ chat-template presence) WITHOUT
     // faulting in weights: dims, context window, MoE-ness, and capabilities.
-    // `/v1/models` isn't hot, so reading a small JSON per unloaded entry is fine.
-    const sm = model_discovery.readStubMeta(io, allocator, entry.path);
+    const sm = stubMeta(io, allocator, entry.path);
 
     // Capabilities. Encoder-only models advertise "embeddings"; chat models get
     // chat/tool_use/streaming/json_schema (gated on chat-template presence, the
@@ -369,7 +379,11 @@ pub fn renderModelEntry(
     // ready path would.
     const is_gguf_stub = std.mem.eql(u8, entry.arch_hint, "gguf");
     const gguf_context = if (is_gguf_stub) ggufContextCap(io, entry) else 0;
-    const stub_context = if (gguf_context > 0) gguf_context else if (sm.found) sm.max_position_embeddings else 0;
+    const native_context = if (gguf_context > 0) gguf_context else if (sm.found) sm.max_position_embeddings else 0;
+    const stub_context = if (gguf_context == 0 and sm.found)
+        advertisedStubContext(native_context, http_server.manualContextFor(request_model.g_model_aliases.ctxSizeFor(io, .{ .path = entry.path, .real = entry.real_path })))
+    else
+        native_context;
     // Native media-gen stub (image/audio/video) — advertise the modality from
     // the discovery-peeked arch_hint so the app can find it before loading.
     const media_modality = media_mod.modalityFromType(entry.arch_hint);
@@ -434,8 +448,7 @@ pub fn renderModelEntry(
     defer allocator.free(stub_speech);
 
     const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
-        // arch_hint comes from config.json's model_type via discovery — the
-        // supported-type allowlist guarantees no JSON metacharacters.
+        // arch_hint comes from config.json's model_type via discovery, which admits [A-Za-z0-9_.-] only.
         break :blk try std.fmt.allocPrint(allocator, "\"architecture\":\"{s}\",", .{entry.arch_hint});
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
@@ -450,7 +463,7 @@ pub fn renderModelEntry(
 
     // Top-level twins of meta.context_length (issue #188): openai-models-list
     // discovery clients read row-level max_model_len/context_length. Unloaded
-    // stubs advertise the architectural max — the same number meta carries here.
+    // stubs advertise the same number meta carries here.
     const top_ctx_part: []const u8 = if (sm.found or stub_context > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, ",\"context_length\":{d},\"max_model_len\":{d}", .{
             stub_context,
@@ -468,6 +481,7 @@ pub fn renderModelEntry(
             quantizationJson(&quant_buf, sm.quant_bits),
             stub_context,
             stub_context,
+            native_context,
             if (sm.is_moe) "true" else "false",
             if (sm.has_mtp) "true" else "false",
         });
@@ -518,7 +532,7 @@ pub fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: 
     var ordered = std.ArrayList(*LoadedModel).empty;
     defer ordered.deinit(allocator);
     var alias_buf: [std.fs.max_path_bytes]u8 = undefined;
-    // Any re-read happens here, not under the registry lock below.
+    // Start the recheck here; the per-row alias/pin reads under the registry lock below ride the refreshed copy.
     request_model.g_model_aliases.refreshNow(io);
     {
         registry.mutex.lockUncancelable(io);
@@ -542,7 +556,7 @@ pub fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: 
             if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
             const json = try renderModelEntry(allocator, io, entry);
             defer allocator.free(json);
-            try appendAliasedRow(allocator, &entries_buf, json, request_model.g_model_aliases.aliasForPath(io, entry.path, &alias_buf));
+            try appendAliasedRow(allocator, &entries_buf, json, request_model.g_model_aliases.aliasForPath(io, .{ .path = entry.path, .real = entry.real_path }, &alias_buf));
         }
     }
 
@@ -620,7 +634,7 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     const l = http_server.g_lan orelse return sendResponseFramed(stream, "200 OK", "application/json", body);
     if (stream.ws_mode != null) return sendResponseFramed(stream, "200 OK", "application/json", body);
     var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: " ++ ALLOW_HEADERS ++ "\r\n\r\n", .{
         body.len,
         &l.token_hex,
     }) catch return error.Overflow;
@@ -1225,6 +1239,82 @@ test "an unloaded row carries its agent budget, media modality and engines" {
     const engines = ip.value.object.get("engines").?.array.items;
     try testing.expectEqual(@as(usize, 1), engines.len);
     try testing.expectEqualStrings("mlx", engines[0].string);
+}
+
+// The bar: the stub advertises the ctx_size pin a load serves at, not the native max.
+test "an unloaded stub with a ctx_size pin advertises the pin; model_max_tokens stays native" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "chat");
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/config.json", .data = "{\"model_type\":\"llama\",\"max_position_embeddings\":1048576}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/chat_template.jinja", .data = "{{ messages }}" });
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const chat_path = try std.fs.path.join(a, &.{ root, "chat" });
+    defer a.free(chat_path);
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const chat = try reg.registerStubWithArch("chat", chat_path, 0, "llama");
+
+    const pin = try std.fmt.allocPrint(a, "{{\"{s}\": {{\"ctx_size\": 262144}}}}", .{chat_path});
+    defer a.free(pin);
+    const saved = request_model.g_model_aliases.settings;
+    request_model.g_model_aliases.settings = try model_settings_mod.parse(a, pin);
+    defer {
+        request_model.g_model_aliases.settings.deinit();
+        request_model.g_model_aliases.settings = saved;
+    }
+
+    const json = try renderModelEntry(a, io, chat);
+    defer a.free(json);
+    const p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer p.deinit();
+    try testing.expectEqual(@as(i64, 262144), p.value.object.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 262144), p.value.object.get("max_model_len").?.integer);
+    const meta = p.value.object.get("meta").?.object;
+    try testing.expectEqual(@as(i64, 262144), meta.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 1048576), meta.get("model_max_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 262144), p.value.object.get("agent_budget").?.object.get("context").?.integer);
+}
+
+test "an unloaded stub with no pin advertises the launch --ctx-size" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "chat");
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/config.json", .data = "{\"model_type\":\"llama\",\"max_position_embeddings\":1048576}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/chat_template.jinja", .data = "{{ messages }}" });
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const chat_path = try std.fs.path.join(a, &.{ root, "chat" });
+    defer a.free(chat_path);
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const chat = try reg.registerStubWithArch("chat", chat_path, 0, "llama");
+
+    const saved = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = saved;
+    http_server.serverState().server_config.max_context_size = 262144;
+
+    const json = try renderModelEntry(a, io, chat);
+    defer a.free(json);
+    const p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer p.deinit();
+    try testing.expectEqual(@as(i64, 262144), p.value.object.get("context_length").?.integer);
+    const meta = p.value.object.get("meta").?.object;
+    try testing.expectEqual(@as(i64, 262144), meta.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 1048576), meta.get("model_max_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 262144), p.value.object.get("agent_budget").?.object.get("context").?.integer);
+}
+
+test "advertisedStubContext: the pin wins over the native max, no pin keeps it" {
+    try testing.expectEqual(@as(u32, 262144), advertisedStubContext(1048576, 262144));
+    try testing.expectEqual(@as(u32, 1048576), advertisedStubContext(1048576, 0));
+    // A pin above the native max is what a load enforces too (manualContext): advertise it verbatim.
+    try testing.expectEqual(@as(u32, 1048576), advertisedStubContext(262144, 1048576));
 }
 
 test "readyCapsJson: embeddings capability — encoders alone, decoders beside chat" {

@@ -680,7 +680,7 @@ pub const ModelRegistry = struct {
         errdefer self.allocator.free(path_owned);
         const arch_owned: []const u8 = if (arch_hint.len > 0) try self.allocator.dupe(u8, arch_hint) else "";
         errdefer if (arch_owned.len > 0) self.allocator.free(arch_owned);
-        const real_owned = try self.realPathDupe(path);
+        const real_owned = model_discovery.realPathOrEmpty(self.io, self.allocator, path);
         errdefer if (real_owned.len > 0) self.allocator.free(real_owned);
 
         stub.* = .{
@@ -715,6 +715,16 @@ pub const ModelRegistry = struct {
         return stub;
     }
 
+    /// The entry a `--model` GGUF file boots as: the discovered entry that serves it (its folder, when the folder picks
+    /// this file), else a new stub under `id`, or under the file's own name when `id` is another path's.
+    pub fn entryForFile(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64) !*LoadedModel {
+        if (self.peekByPath(path)) |e| return e;
+        return self.registerStub(id, path, bytes_on_disk) catch |err| switch (err) {
+            error.DuplicateId => self.registerStub(std.fs.path.basename(path), path, bytes_on_disk),
+            else => err,
+        };
+    }
+
     /// Register-by-path (/v1/load-model with an absolute path): validate
     /// `abs_path` exactly like discovery would (config.json, supported
     /// model_type + quant mode) and insert an `.unloaded` stub keyed by the
@@ -734,7 +744,8 @@ pub const ModelRegistry = struct {
         const base = std.fs.path.basename(trimmed);
         if (base.len == 0) return error.InvalidModelPath;
         const stem = if (std.mem.endsWith(u8, base, ".gguf") and base.len > ".gguf".len) base[0 .. base.len - ".gguf".len] else base;
-        const reg_id = id orelse stem;
+        var hub_buf: [256]u8 = undefined;
+        const reg_id = id orelse hubCacheRepoId(&hub_buf, trimmed) orelse stem;
 
         // Fast path: already registered (discovered, --model, or a previous
         // register-by-path). No filesystem touch.
@@ -780,11 +791,12 @@ pub const ModelRegistry = struct {
     /// two ids for one path would let the same weights load twice.
     pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const real = model_discovery.realPathInto(self.io, path, &buf);
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.peekByPathLocked(path)) |e| return e;
+            if (self.findDirLocked(path, real)) |e| return e;
         }
-        if (self.peekByRealPath(path)) |e| return e;
         // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it. Only the file the
         // folder serves: another quant beside it is a model of its own.
         if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| if (self.peekByPath(dir)) |e| {
@@ -803,35 +815,12 @@ pub const ModelRegistry = struct {
         return std.mem.eql(u8, ra, rb);
     }
 
-    /// The same directory under another spelling: a symlink, either way round.
-    fn peekByRealPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
-        if (!std.fs.path.isAbsolute(path)) return null;
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const real = buf[0 .. std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return null];
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    /// The entry holding this folder under any spelling: the same path, or a symlink either way round
+    /// (`real` from `realPathInto`). Caller holds `mutex`.
+    fn findDirLocked(self: *ModelRegistry, path: []const u8, real: []const u8) ?*LoadedModel {
+        if (std.mem.trimEnd(u8, path, "/").len == 0) return null;
         var it = self.entries.valueIterator();
-        while (it.next()) |e| if (e.*.real_path.len > 0 and std.mem.eql(u8, e.*.real_path, real)) return e.*;
-        return null;
-    }
-
-    fn realPathDupe(self: *ModelRegistry, path: []const u8) ![]const u8 {
-        if (!std.fs.path.isAbsolute(path)) return "";
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const n = std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return "";
-        return try self.allocator.dupe(u8, buf[0..n]);
-    }
-
-    fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
-        var trimmed = path;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-        if (trimmed.len == 0) return null;
-        var it = self.entries.valueIterator();
-        while (it.next()) |entry_ptr| {
-            var entry_path: []const u8 = entry_ptr.*.path;
-            while (entry_path.len > 0 and entry_path[entry_path.len - 1] == '/') entry_path = entry_path[0 .. entry_path.len - 1];
-            if (std.mem.eql(u8, entry_path, trimmed)) return entry_ptr.*;
-        }
+        while (it.next()) |e| if (model_discovery.sameDir(e.*.path, e.*.real_path, path, real)) return e.*;
         return null;
     }
 
@@ -848,11 +837,18 @@ pub const ModelRegistry = struct {
         if (roots.len == 0) return 0;
         var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer found.deinit();
+        // Resolved before the lock: a registered spelling of the folder may differ.
+        const reals = try self.allocator.alloc([]const u8, found.models.len);
+        defer {
+            for (reals) |r| if (r.len > 0) self.allocator.free(r);
+            self.allocator.free(reals);
+        }
+        for (found.models, reals) |m, *r| r.* = model_discovery.realPathOrEmpty(self.io, self.allocator, m.path);
         var added: u32 = 0;
         var cleared: u32 = 0;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (found.models) |m| {
+        for (found.models, reals) |m, real| {
             if (self.entries.get(m.id)) |e| {
                 if (e.state == .error_state and std.mem.eql(u8, e.path, m.path)) {
                     self.markUnloadedLocked(e);
@@ -861,7 +857,7 @@ pub const ModelRegistry = struct {
                 }
                 continue;
             }
-            if (self.peekByPathLocked(m.path) != null) continue;
+            if (self.findDirLocked(m.path, real) != null) continue;
             _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
             added += 1;
         }
@@ -1294,8 +1290,7 @@ pub const ModelRegistry = struct {
     /// chosen victim `.evicting` and writes it into `out`; returns the count,
     /// or null if the caps can't be met (no more evictable victims, or `out`
     /// too small) — in which case any victims marked here are rolled back so
-    /// the registry is left untouched. `forced` (idle, `.ready`) is the first
-    /// victim whatever the caps say. Caller holds `mutex` and must drain each
+    /// the registry is left untouched. Caller holds `mutex` and must drain each
     /// returned victim's refcount, then hand them to the load request to free.
     pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, forced: ?*LoadedModel, out: []*LoadedModel, live_bytes: u64) ?usize {
         var n: usize = 0;
@@ -1303,6 +1298,8 @@ pub const ModelRegistry = struct {
         // Live bytes a victim gives back: its weights and its hot prefix cache.
         var freed_live: u64 = 0;
         var freed_slots: u32 = 0;
+        // An exclusive-resource holder (the process's one ds4 engine, the one foreign-bytes reader) goes first:
+        // the new load cannot proceed beside it regardless of what the caps say.
         if (forced) |v| {
             self.markEvictingLocked(v);
             out[0] = v;
@@ -1340,6 +1337,19 @@ pub const ModelRegistry = struct {
             out[n] = victim;
             n += 1;
         }
+    }
+
+    /// MLX bytes the ready models hold as loaded: each load's own measure (`bytes_live`), its bill where none was
+    /// taken. The bill alone would count a host-mapped table that is not MLX memory.
+    pub fn residentLiveBytes(self: *ModelRegistry, io: std.Io) u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var bytes: u64 = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| {
+            if (e.*.state == .ready) bytes += if (e.*.bytes_live != 0) e.*.bytes_live else e.*.bytes_resident;
+        }
+        return bytes;
     }
 
     fn liveBytesFreed(v: *const LoadedModel) u64 {
@@ -1406,8 +1416,9 @@ pub const ModelRegistry = struct {
     /// Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, DistWorkerNotJoined } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, DistWorkerNotJoined, GpuTimeout } {
         if (name) |n| {
+            if (std.mem.eql(u8, n, "GpuTimeout")) return error.GpuTimeout;
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "DistWorkerNotJoined")) return error.DistWorkerNotJoined;
@@ -1424,6 +1435,8 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("OutOfMemory"));
         // So does a worker Mac that has not joined: the user starts it and retries.
         try std.testing.expectEqual(error.DistWorkerNotJoined, loadErrorFromName("DistWorkerNotJoined"));
+        // So does a GPU timeout: the load is retried once memory settles.
+        try std.testing.expectEqual(error.GpuTimeout, loadErrorFromName("GpuTimeout"));
         // Everything else stays a load failure — guessing a diagnosis is worse
         // than reporting the honest generic one.
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
@@ -1535,6 +1548,26 @@ fn makeReadyStub(reg: *ModelRegistry, id: []const u8, bytes: u64) !*LoadedModel 
     defer reg.mutex.unlock(reg.io);
     reg.markReadyLocked(stub, bytes);
     return stub;
+}
+
+/// `<org>/<repo>` for a Hugging Face hub-cache snapshot (`…/models--<org>--<repo>/snapshots/<40-hex commit>`), else
+/// null: the folder's own name there is the commit, which `/v1/models` would list as the model's id.
+fn hubCacheRepoId(buf: []u8, path: []const u8) ?[]const u8 {
+    const commit = std.fs.path.basename(path);
+    if (commit.len != 40) return null;
+    for (commit) |c| if (!std.ascii.isHex(c)) return null;
+    const snapshots = std.fs.path.dirname(path) orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(snapshots), "snapshots")) return null;
+    const repo_dir = std.fs.path.basename(std.fs.path.dirname(snapshots) orelse return null);
+    const prefix = "models--";
+    if (!std.mem.startsWith(u8, repo_dir, prefix) or repo_dir.len == prefix.len) return null;
+    const name = repo_dir[prefix.len..];
+    if (name.len > buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    const sep = std.mem.indexOf(u8, name, "--") orelse return buf[0..name.len];
+    buf[sep] = '/';
+    @memmove(buf[sep + 1 .. name.len - 1], name[sep + 2 ..]);
+    return buf[0 .. name.len - 1];
 }
 
 test "ModelRegistry: init/deinit empty" {
@@ -1712,6 +1745,30 @@ test "ModelRegistry: registerByPath takes a .gguf file, named by its stem as --m
     try testing.expectError(error.UnsupportedArch, reg.registerByPath(io, sidecar, null));
 }
 
+test "ModelRegistry: a Hugging Face hub-cache snapshot registers under its repo id, not its commit" {
+    // Bar: `/v1/models` names the repo; the snapshot folder's name is a commit hash no client can read.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const snap = "hub/models--OpensourceWTF--Next-EXL3/snapshots/ed79daeb7c1adab095e5079c4552ae678398eb8f";
+    try tmp.dir.createDirPath(io, snap);
+    try tmp.dir.writeFile(io, .{ .sub_path = snap ++ "/config.json", .data = "{\"model_type\":\"llama\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}/", .{ root, snap });
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings("OpensourceWTF/Next-EXL3", try reg.registerByPath(io, path, null));
+
+    var id_buf: [256]u8 = undefined;
+    // No org; a folder that is not a commit, or not under `snapshots`, keeps its own name.
+    try testing.expectEqualStrings("gpt2", hubCacheRepoId(&id_buf, "/c/hub/models--gpt2/snapshots/ed79daeb7c1adab095e5079c4552ae678398eb8f").?);
+    try testing.expect(hubCacheRepoId(&id_buf, "/c/hub/models--a--b/snapshots/main") == null);
+    try testing.expect(hubCacheRepoId(&id_buf, "/m/models--a--b/ed79daeb7c1adab095e5079c4552ae678398eb8f") == null);
+    try testing.expect(hubCacheRepoId(&id_buf, "/m/a/snapshots/ed79daeb7c1adab095e5079c4552ae678398eb8f") == null);
+}
+
 test "LoadedModel: a reload frees the CPU state the previous load left behind" {
     // Bar: a reload must not orphan the previous generation (testing.allocator fails on leak).
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
@@ -1887,28 +1944,6 @@ test "ModelRegistry: pickIdleEvictable skips non-ready and takes the oldest firs
     try testing.expect(reg.pickIdleEvictable(1_000_000, 900_000).? == old_entry);
     // Only the older one is past it.
     try testing.expect(reg.pickIdleEvictable(901_000, 900_000).? == old_entry);
-}
-
-test "ModelRegistry: the streaming pack's foreign bytes are every other ready model's" {
-    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
-    defer reg.deinit();
-    var cfg = ModelConfig{};
-    cfg.glm_stream = true;
-    const stream = try makeReadyStub(reg, "deepseek", 180_000_000_000);
-    stream.config = &cfg;
-    defer stream.config = null; // borrowed: the registry frees the configs it owns
-    _ = try makeReadyStub(reg, "krea", 14_730_000_000);
-    _ = try reg.registerStub("yue2", "yue2", 4_000_000_000); // discovered, never loaded
-    // A pack streaming its expert bank through the plugin (MiMo) is foreign: it does not read the value.
-    var mimo_cfg = ModelConfig{};
-    mimo_cfg.expert_bank = true;
-    const mimo = try makeReadyStub(reg, "mimo", 9_000_000_000);
-    mimo.config = &mimo_cfg;
-    defer mimo.config = null;
-
-    reg.mutex.lockUncancelable(reg.io);
-    defer reg.mutex.unlock(reg.io);
-    try testing.expectEqual(@as(u64, 14_730_000_000 + 9_000_000_000), reg.streamForeignBytesLocked());
 }
 
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {
@@ -2204,7 +2239,7 @@ test "planEvictions: evicts one LRU victim to fit the memory budget" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(c.id, null, &buf, 0).?;
+    const n = reg.planEvictionsLocked(c.id, &buf, 0).?;
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a", buf[0].id); // LRU victim
     try testing.expectEqual(LoadState.evicting, buf[0].state);
@@ -2221,9 +2256,9 @@ test "planEvictions: live memory above the billed weights forces an eviction" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, null, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0));
     // KV, caches and a wired table put 95 bytes live: 95 + 10 > 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 95));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2242,7 +2277,7 @@ test "planEvictions: an idle victim's prefix cache counts as freed live memory (
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // 95 live = a's 40 weights + its 50-byte cache + 5: evicting a leaves 5 + 50 <= 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 95));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2258,7 +2293,7 @@ test "planEvictions: a victim frees the live bytes its load measured, not just i
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // 85 live, 80 of them a's: evicting a leaves 5 + 50 <= 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 85));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, &buf, 85));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2274,7 +2309,7 @@ test "planEvictions: multi-victim — evicts as many as needed to fit" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(d.id, null, &buf, 0).?;
+    const n = reg.planEvictionsLocked(d.id, &buf, 0).?;
     try testing.expectEqual(@as(usize, 2), n); // a and b (the two oldest)
 }
 
@@ -2288,7 +2323,7 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     const b = try beginLoad(reg, "b", 80); // 80 + 80 = 160 > 100 → must evict a
     reg.mutex.lockUncancelable(io);
     var buf: [16]*LoadedModel = undefined;
-    const plan = reg.planEvictionsLocked(b.id, null, &buf, 0);
+    const plan = reg.planEvictionsLocked(b.id, &buf, 0);
     try testing.expectEqual(@as(?usize, null), plan); // can't evict the pinned victim
     try testing.expectEqual(LoadState.ready, a.state); // rolled back, not left .evicting
     // Scheduler then rolls back the load → releases the reservation.
@@ -2352,7 +2387,7 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, null, &buf, 0));
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
 }
 
 test "planEvictions: a transcription's aligner and diarizer take no model slot" {
@@ -2371,12 +2406,12 @@ test "planEvictions: a transcription's aligner and diarizer take no model slot" 
     reg.reserveLoadLocked(diarizer, 10);
     var buf: [16]*LoadedModel = undefined;
     // chat and asr fill the two slots; the companions sit beside them.
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, null, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, &buf, 0));
     reg.markReadyLocked(diarizer, 10);
     // A third model that takes a slot evicts the oldest that holds one, never a companion.
     try testing.expect(reg.tryBeginLoadLocked(image));
     reg.reserveLoadLocked(image, 10);
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, null, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, &buf, 0));
     try testing.expectEqual(chat, buf[0]);
 }
 
@@ -2391,7 +2426,7 @@ test "planEvictions: another model still loading counts against the model cap" {
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // a + b + c would be three models under a cap of two: `a` has to go.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2524,6 +2559,31 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     try testing.expect(reg.peek("org/first") != null);
 }
 
+test "ModelRegistry: rescan adds no second entry for a folder registered through a symlink" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "lib");
+    try tmp.dir.symLink(io, "lib", "link", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const lib = try std.fs.path.join(testing.allocator, &.{ base, "lib" });
+    defer testing.allocator.free(lib);
+    const via_link = try std.fs.path.join(testing.allocator, &.{ base, "link", "org", "m" });
+    defer testing.allocator.free(via_link);
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{lib});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    try tmp.dir.createDirPath(io, "lib/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/org/m/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/org/m/model.safetensors", .data = "0123" });
+
+    _ = try reg.registerByPath(io, via_link, null);
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(@as(u32, 1), reg.entries.count());
+}
+
 test "ModelRegistry: rescan clears a failed load so the completed dir can load again" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2557,6 +2617,43 @@ test "ModelRegistry: rescan clears a failed load so the completed dir can load a
     const fine = reg.peek("org/fine") orelse return error.TestExpectedResult;
     try testing.expectEqual(LoadState.unloaded, fine.state);
     try testing.expectEqual(@as(?u64, 4), fine.bytes_on_disk);
+}
+
+test "ModelRegistry: a GGUF --model file joins the discovered catalog without a second row" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "org/pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/pack/a.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/pack/b.gguf", .data = "GGUF" });
+    try tmp.dir.createDirPath(io, "org/sibling");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/sibling/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/sibling/model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/model.safetensors", .data = "0123" });
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    const listed = reg.entries.count();
+
+    // The file its folder serves is that folder's entry.
+    const picked = try std.fs.path.join(testing.allocator, &.{ root, "org", "pack", "a.gguf" });
+    defer testing.allocator.free(picked);
+    try testing.expectEqualStrings("org/pack", (try reg.entryForFile("a", picked, 4)).id);
+    try testing.expectEqual(listed, reg.entries.count());
+    try testing.expect(reg.peek("org/sibling") != null);
+
+    // Another quant is a model of its own; its stem is taken by the dir `b`, so it keeps its file name.
+    const other = try std.fs.path.join(testing.allocator, &.{ root, "org", "pack", "b.gguf" });
+    defer testing.allocator.free(other);
+    const e = try reg.entryForFile("b", other, 4);
+    try testing.expectEqualStrings("b.gguf", e.id);
+    try testing.expectEqualStrings(other, e.path);
+    try testing.expectEqual(listed + 1, reg.entries.count());
 }
 
 test "ModelRegistry: registerByPath registers under the caller's org/name id" {
