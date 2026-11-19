@@ -480,7 +480,6 @@ pub fn renderModelEntry(
             sm.num_hidden_layers,
             quantizationJson(&quant_buf, sm.quant_bits),
             stub_context,
-            stub_context,
             native_context,
             if (sm.is_moe) "true" else "false",
             if (sm.has_mtp) "true" else "false",

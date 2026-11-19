@@ -1051,52 +1051,6 @@ pub const ModelRegistry = struct {
         } else {
             self.current_resident_bytes = 0;
         }
-        mlx_engine.api().set_foreign_bytes(self.streamForeignBytesLocked());
-    }
-
-    /// A stream pack whose plugin module reads the process's foreign-bytes value (`mlx_stream.setForeignBytes`):
-    /// GLM-5.3's. The value is one number for the process, so it is correct for one such pack at a
-    /// time: a load of a second unloads the first (`foreignReaderVictimLocked`).
-    pub fn readsForeignBytes(c: *const ModelConfig) bool {
-        return c.glm_stream;
-    }
-
-    /// What every ready model except a stream pack whose module reads the value holds: the plugin bills only its own
-    /// bytes, and its footprint reads are the whole process's. GLM-5.3's module reads it, so its
-    /// packs are left out; a GLM-5.3-Flash stream pack's or an expert-bank pack's bytes are foreign to them. One reader pack at a time
-    /// (`foreignReaderVictimLocked`): with two, each one's bound would leave out the other's residents. Caller holds
-    /// `mutex`.
-    pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
-        var sum: u64 = 0;
-        var it = self.entries.valueIterator();
-        while (it.next()) |entry_ptr| {
-            const entry = entry_ptr.*;
-            if (entry.state != .ready) continue;
-            if (entry.config) |c| if (readsForeignBytes(c)) continue;
-            sum +|= entry.bytes_resident;
-        }
-        return sum;
-    }
-
-    /// The entry a load of `incoming` unloads first: another resident stream pack that reads the foreign-bytes value,
-    /// when `incoming` reads it too; else null. One in use, loading or evicting is `error.ForeignBytesReaderBusy`.
-    /// Caller holds `mutex`.
-    pub fn foreignReaderVictimLocked(self: *ModelRegistry, exclude_id: []const u8, incoming: *const ModelConfig) error{ForeignBytesReaderBusy}!?*LoadedModel {
-        if (!readsForeignBytes(incoming)) return null;
-        var it = self.entries.valueIterator();
-        while (it.next()) |entry_ptr| {
-            const entry = entry_ptr.*;
-            if (std.mem.eql(u8, entry.id, exclude_id)) continue;
-            if (entry.state != .ready and entry.state != .loading and entry.state != .evicting) continue;
-            const c = entry.config orelse continue;
-            if (!readsForeignBytes(c)) continue;
-            if (entry.state != .ready or entry.refcount.load(.acquire) != 0) {
-                log.err("{s}: refused: {s} is busy, and both stream packs read the one process foreign-bytes value\n", .{ exclude_id, entry.id });
-                return error.ForeignBytesReaderBusy;
-            }
-            return entry;
-        }
-        return null;
     }
 
     /// ds4 has process-wide model globals and exits on a second open. Evict an idle owner; refuse another load
@@ -1222,7 +1176,6 @@ pub const ModelRegistry = struct {
         // tick, undoing an explicit /v1/load-model the moment it finished.
         entry.last_used_ms.store(io_util.nowMsMonotonic(self.io), .release);
         self.current_resident_bytes += bytes_resident;
-        mlx_engine.api().set_foreign_bytes(self.streamForeignBytesLocked());
         // Headless default promotion: a server started without --model has no
         // default, so requests addressing the "mlx-serve" alias (the app's
         // chat/avatar surfaces, Claude Code) 503 with no_model even after the
@@ -1298,7 +1251,7 @@ pub const ModelRegistry = struct {
         // Live bytes a victim gives back: its weights and its hot prefix cache.
         var freed_live: u64 = 0;
         var freed_slots: u32 = 0;
-        // An exclusive-resource holder (the process's one ds4 engine, the one foreign-bytes reader) goes first:
+        // An exclusive-resource holder (the process's one ds4 engine) goes first:
         // the new load cannot proceed beside it regardless of what the caps say.
         if (forced) |v| {
             self.markEvictingLocked(v);
@@ -2748,41 +2701,6 @@ test "ModelRegistry: ds4 ownership follows the published native engine including
     reg.markReadyLocked(first, 100);
     try testing.expect(!first.ds4_route);
     try testing.expect(try reg.ds4EngineVictimLocked("second-gguf", true) == null);
-}
-
-test "ModelRegistry: a second stream pack that reads the foreign bytes unloads an idle one and is refused by a busy one" {
-    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
-    defer reg.deinit();
-    var dsv41_cfg = ModelConfig{};
-    dsv41_cfg.glm_stream = true;
-    const dsv41 = try makeReadyStub(reg, "deepseek", 180_000_000_000);
-    dsv41.config = &dsv41_cfg;
-    defer dsv41.config = null;
-    var glm_cfg = ModelConfig{};
-    glm_cfg.glm_stream = true;
-    var mimo_cfg = ModelConfig{};
-    mimo_cfg.expert_bank = true;
-    const plain = ModelConfig{};
-    const glm = try beginLoad(reg, "glm", 100);
-
-    reg.mutex.lockUncancelable(reg.io);
-    defer reg.mutex.unlock(reg.io);
-    // MiMo and a model without a stream pack do not read the value; a reload of the same id is not a second reader.
-    try testing.expect(try reg.foreignReaderVictimLocked("mimo", &mimo_cfg) == null);
-    try testing.expect(try reg.foreignReaderVictimLocked("plain", &plain) == null);
-    try testing.expect(try reg.foreignReaderVictimLocked("deepseek", &dsv41_cfg) == null);
-    // Busy: refused by name, nothing marked.
-    _ = dsv41.refcount.fetchAdd(1, .acq_rel);
-    try testing.expectError(error.ForeignBytesReaderBusy, reg.foreignReaderVictimLocked("glm", &glm_cfg));
-    dsv41.refcount.store(0, .release);
-    // Idle: the plan evicts it although both caps hold.
-    const victim = (try reg.foreignReaderVictimLocked("glm", &glm_cfg)).?;
-    try testing.expectEqualStrings("deepseek", victim.id);
-    var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(glm.id, victim, &buf, 0));
-    try testing.expectEqual(LoadState.evicting, dsv41.state);
-    reg.unmarkEvictingLocked(dsv41);
-    reg.markUnloadedLocked(glm);
 }
 
 test "UnloadMark: models unloaded together count as one pending release" {

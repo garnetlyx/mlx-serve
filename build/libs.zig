@@ -266,3 +266,4 @@ pub fn addStreamSources(b: *std.Build, m: *std.Build.Module, inject: bool) void 
     m.addRPath(.{ .cwd_relative = "@executable_path/../Frameworks" });
     m.addRPath(.{ .cwd_relative = "@executable_path/lib" });
 }
+
