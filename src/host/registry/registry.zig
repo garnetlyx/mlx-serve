@@ -2192,7 +2192,7 @@ test "planEvictions: evicts one LRU victim to fit the memory budget" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(c.id, &buf, 0).?;
+    const n = reg.planEvictionsLocked(c.id, null, &buf, 0).?;
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a", buf[0].id); // LRU victim
     try testing.expectEqual(LoadState.evicting, buf[0].state);
@@ -2209,9 +2209,9 @@ test "planEvictions: live memory above the billed weights forces an eviction" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, null, &buf, 0));
     // KV, caches and a wired table put 95 bytes live: 95 + 10 > 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 95));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2230,7 +2230,7 @@ test "planEvictions: an idle victim's prefix cache counts as freed live memory (
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // 95 live = a's 40 weights + its 50-byte cache + 5: evicting a leaves 5 + 50 <= 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, &buf, 95));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2246,7 +2246,7 @@ test "planEvictions: a victim frees the live bytes its load measured, not just i
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // 85 live, 80 of them a's: evicting a leaves 5 + 50 <= 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, &buf, 85));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 85));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2262,7 +2262,7 @@ test "planEvictions: multi-victim — evicts as many as needed to fit" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(d.id, &buf, 0).?;
+    const n = reg.planEvictionsLocked(d.id, null, &buf, 0).?;
     try testing.expectEqual(@as(usize, 2), n); // a and b (the two oldest)
 }
 
@@ -2276,7 +2276,7 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     const b = try beginLoad(reg, "b", 80); // 80 + 80 = 160 > 100 → must evict a
     reg.mutex.lockUncancelable(io);
     var buf: [16]*LoadedModel = undefined;
-    const plan = reg.planEvictionsLocked(b.id, &buf, 0);
+    const plan = reg.planEvictionsLocked(b.id, null, &buf, 0);
     try testing.expectEqual(@as(?usize, null), plan); // can't evict the pinned victim
     try testing.expectEqual(LoadState.ready, a.state); // rolled back, not left .evicting
     // Scheduler then rolls back the load → releases the reservation.
@@ -2340,7 +2340,7 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, null, &buf, 0));
 }
 
 test "planEvictions: a transcription's aligner and diarizer take no model slot" {
@@ -2359,12 +2359,12 @@ test "planEvictions: a transcription's aligner and diarizer take no model slot" 
     reg.reserveLoadLocked(diarizer, 10);
     var buf: [16]*LoadedModel = undefined;
     // chat and asr fill the two slots; the companions sit beside them.
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, null, &buf, 0));
     reg.markReadyLocked(diarizer, 10);
     // A third model that takes a slot evicts the oldest that holds one, never a companion.
     try testing.expect(reg.tryBeginLoadLocked(image));
     reg.reserveLoadLocked(image, 10);
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, null, &buf, 0));
     try testing.expectEqual(chat, buf[0]);
 }
 
@@ -2379,7 +2379,7 @@ test "planEvictions: another model still loading counts against the model cap" {
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // a + b + c would be three models under a cap of two: `a` has to go.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 0));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
