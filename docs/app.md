@@ -26,6 +26,8 @@ Menu-bar app that wraps the server with a full UI. [Download the latest release]
 
 ## Image / Video / Music / Speech / 3D generation
 
+**Quick Create** — Create ▸ Quick Create: pick a template (Santa, Pet Talk, Reaction, Dance Party, Hug, Royal Portrait, Corporate Headshot, Movie Poster, Action Figure, Birthday Song, Theme Song, Power Ballad, Roast Rap), add photos of your people and pets to the cast library, and the app writes the prompt and renders it locally. Results land in the gallery beside the templates.
+
 One server, five modalities — the **Image**, **Video**, **Audio** (speech + music) and **3D** Create panes run [FLUX.2](https://huggingface.co/black-forest-labs) / Krea-2 / Microsoft Mage-Flow, [LTX-Video 2.3 and 2.5](https://github.com/dgrauet/ltx-2-mlx) / [MiniMax-H3](https://huggingface.co/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit), [ACE-Step 1.5](https://huggingface.co/ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit) / MiniMax Music 3, [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) / [Kokoro-82M](https://huggingface.co/ddalcu/Kokoro-82M-MLX-Serve), and [Hunyuan3D-2.1](https://huggingface.co/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit) natively on MLX. Click a pane, hit **Download**, generate. Drag a file onto any pane and it lands in the right slot, reference lists included. Each pane remembers your last-used model, quality, resolution, steps and seed between sessions.
 
 The panes also list checkpoints you added yourself: anything in your model folders with a family the server can run shows under **On This Mac** with that family's controls, and the Model Browser offers community packs of those families, layout-checked before the Download button appears.

@@ -82,7 +82,7 @@ Decode speed in v26.11.3 on an M5 Ultra with 256 GB, on a code prompt, with spec
 | Gemma 4 26B-A4B, 4-bit | 184 |
 | Qwen3.8-Flash-Next, 4.7 bits | 168 |
 
-On an M4 Max, the same models decode 10% to 47% faster than they did in v26.8. Every release is measured the same way in [benchmarks.md](benchmarks.md); speculative decoding and tuning are in [docs/performance.md](docs/performance.md).
+On an M4 Max, the same models decode 10% to 47% faster than they did in v26.8 (the iQ-MLX Qwen3.8-Flash-Next pack is new there: 88 tok/s, 1% under v26.11.2). Every release is measured the same way in [benchmarks.md](benchmarks.md); speculative decoding and tuning are in [docs/performance.md](docs/performance.md).
 
 ## Docs
 
