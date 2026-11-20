@@ -121,7 +121,7 @@ pub extern fn mlx_llama_seq_sync_images(
     n_images: i32,
     marker: [*]const i32,
     n_marker: i32,
-    max_tokens: u32,
+    max_tokens: *u32,
     out_expanded: *u32,
     cancelled: CancelFn,
     cancel_ud: ?*anyopaque,

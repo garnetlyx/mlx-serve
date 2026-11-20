@@ -40,7 +40,9 @@ STAMP="$DEST/.version"
 case "$OS" in Linux) LIB=libllama.so ;; Windows) LIB=llama.lib ;; *) LIB=libllama.dylib ;; esac
 
 # Idempotent: skip when the staged copy already matches the pinned tag.
-if [ -f "$STAMP" ] && [ -f "$DEST_LIB/$LIB" ] && [ -f "$DEST_INC/llama.h" ]; then
+case "$OS" in Linux) MTMD=libmtmd.so ;; Windows) MTMD=mtmd.lib ;; *) MTMD="$LIB" ;; esac
+if [ -f "$STAMP" ] && [ -f "$DEST_LIB/$LIB" ] && [ -f "$DEST_LIB/$MTMD" ] &&
+   [ -f "$DEST_INC/llama.h" ] && [ -f "$DEST_INC/mtmd.h" ] && [ -f "$DEST_INC/mtmd-helper.h" ]; then
   if [ "$(cat "$STAMP")" = "$LLAMA_TAG" ]; then
     echo "[fetch-llama] lib/llama already at $LLAMA_TAG — nothing to do"
     exit 0

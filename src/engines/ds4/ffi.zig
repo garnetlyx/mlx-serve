@@ -335,6 +335,9 @@ extern fn mlxserve_ds4_sizeof_distributed_options() usize;
 extern fn mlxserve_ds4_sizeof_tokens() usize;
 extern fn mlxserve_ds4_sizeof_context_memory() usize;
 extern fn mlxserve_ds4_sizeof_session_snapshot() usize;
+extern fn mlxserve_ds4_sizeof_vision_embedding() usize;
+extern fn mlxserve_ds4_sizeof_vision_span() usize;
+extern fn mlxserve_ds4_offsetof_vision_span_embedding() usize;
 
 test "ds4 FFI mirror layout matches ds4.h (mid-struct-insert guard)" {
     // Upstream inserts fields mid-struct on upgrades; a stale mirror corrupts
@@ -349,8 +352,7 @@ test "ds4 FFI mirror layout matches ds4.h (mid-struct-insert guard)" {
     try std.testing.expectEqual(mlxserve_ds4_sizeof_tokens(), @sizeOf(Tokens));
     try std.testing.expectEqual(mlxserve_ds4_sizeof_context_memory(), @sizeOf(ContextMemory));
     try std.testing.expectEqual(mlxserve_ds4_sizeof_session_snapshot(), @sizeOf(SessionSnapshot));
-    // The vision-span mirror (sizeof_vision_embedding/span, offsetof_vision_span_embedding)
-    // returns when lib/ds4 exports those helpers: b3f5018 has no such exports, so the
-    // assertions reference symbols no pin defines and the ds4 shard fails to link.
-    // Re-add with the C side together.
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_vision_embedding(), @sizeOf(VisionEmbedding));
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_vision_span(), @sizeOf(VisionSpan));
+    try std.testing.expectEqual(mlxserve_ds4_offsetof_vision_span_embedding(), @offsetOf(VisionSpan, "embedding"));
 }

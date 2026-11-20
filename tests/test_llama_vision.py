@@ -29,7 +29,7 @@ Usage:
   python3 tests/test_llama_vision.py --model <id-from-/v1/models> [--base-url http://127.0.0.1:8000]
                                      [--api-key ...] [--timeout 120] [--case red_blue,stream]
 
---api-key defaults to $AIM_SHARED_KEY. The key and image bytes are never
+--api-key defaults to $BENCH_API_KEY. The key and image bytes are never
 printed; error bodies are truncated and base64-looking runs redacted.
 Exit 0 = all checks pass, 1 = any failure.
 """
@@ -389,8 +389,8 @@ def main():
     parser = argparse.ArgumentParser(description="Llama-engine vision e2e regression against a running server")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", required=True, help="model id as listed by /v1/models")
-    parser.add_argument("--api-key", default=os.environ.get("AIM_SHARED_KEY", ""),
-                        help="bearer key (default: $AIM_SHARED_KEY; never logged)")
+    parser.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", ""),
+                        help="bearer key (default: $BENCH_API_KEY; never logged)")
     parser.add_argument("--timeout", type=int, default=120, help="per-request timeout in seconds")
     parser.add_argument("--case", default="", help="comma-separated subset, e.g. red_blue,stream (default: all)")
     global ARGS

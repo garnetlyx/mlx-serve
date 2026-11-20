@@ -54,9 +54,9 @@ pub fn submit(slot: *Slot, s: *Served) !void {
     defer eos.deinit(slot.allocator);
     if (!sp.ignore_eos) {
         try eos.appendSlice(slot.allocator, slot.eos_token_ids);
-        for (abi.items(u32, s.info.eos)) |t| {
+        if (s.caps().owns_tokenizer) for (abi.items(u32, s.info.eos)) |t| {
             if (std.mem.indexOfScalar(u32, eos.items, t) == null) try eos.append(slot.allocator, t);
-        }
+        };
     }
     const grammar: abi.Grammar = .{ .kind = .json_schema, .text = .{} };
     const tool_gate: abi.ToolGate = .{ .opener = .{}, .names = .{} };
@@ -252,11 +252,13 @@ test "submit: the engine's events land in the slot from its thread — prefilled
     const cases = [_]struct {
         engine_eos: []const u32,
         request_eos: []const u32,
+        owns_tokenizer: bool = true,
         ignore_eos: bool = false,
         expected: []const u32,
         reason: []const u8,
     }{
         .{ .engine_eos = &.{0}, .request_eos = &.{}, .expected = &.{ 5, 6, 7, 1000, 1001 }, .reason = "length" },
+        .{ .engine_eos = &.{1000}, .request_eos = &.{}, .owns_tokenizer = false, .expected = &.{ 5, 6, 7, 1000, 1001 }, .reason = "length" },
         .{ .engine_eos = engine_eos, .request_eos = &.{}, .expected = &.{ 5, 6, 7 }, .reason = "stop" },
         .{ .engine_eos = engine_eos, .request_eos = &.{ 20, 21, 22, 23, 24, 25, 26, 27 }, .expected = &.{ 5, 6, 7 }, .reason = "stop" },
         .{ .engine_eos = engine_eos, .request_eos = &.{6}, .expected = &.{5}, .reason = "stop" },
@@ -266,6 +268,7 @@ test "submit: the engine's events land in the slot from its thread — prefilled
     var generated: u64 = 0;
     for (cases, 0..) |case, i| {
         s.info.eos = abi.span(u32, case.engine_eos);
+        s.info.caps.owns_tokenizer = case.owns_tokenizer;
         const slot = try Slot.init(testing.allocator, testing.io, &cfg, .{ .model = &lm, .prompt_ids = &.{ 5, 6, 7 }, .sampling = .{ .temperature = 0, .ignore_eos = case.ignore_eos }, .eos_token_ids = case.request_eos, .max_tokens = 5 }, .dense);
         defer slot.deinit();
         try submit(slot, &s);

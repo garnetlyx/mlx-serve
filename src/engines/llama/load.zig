@@ -29,7 +29,7 @@ pub fn open(comptime bridge: type, io: std.Io, gpa: std.mem.Allocator, path: []c
         .load_mtp = s.mtp_drafts > 0,
     });
     errdefer engine.close();
-    const vision = gguf_files.findVisionSidecar(io, gpa, path);
+    const vision = if (s.vision) gguf_files.findVisionSidecar(io, gpa, path) else null;
     defer if (vision) |p| gpa.free(p);
     if (vision) |p| {
         log.info("[llama] vision projector: {s}\n", .{p});

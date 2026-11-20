@@ -492,9 +492,7 @@ pub const LlamaSeq = struct {
     /// model reads.
     ///
     /// Returns the expanded prompt length: the KV cells the prompt took (the
-    /// text plus the images' patches). `max_tokens` is the generation the
-    /// caller intends: the prompt and the generation must fit the sequence's
-    /// context.
+    /// text plus the images' patches). `max_tokens` is reduced to the remaining sequence capacity.
     ///
     /// The sequence is reset first: a multimodal prompt is never served from a
     /// prefix, and the next text prompt on this sequence starts cold too.
@@ -504,7 +502,7 @@ pub const LlamaSeq = struct {
         images: []const Image,
         marker: []const i32,
         cancel: *const std.atomic.Value(bool),
-        max_tokens: u32,
+        max_tokens: *u32,
     ) Error!u32 {
         validateMedia(prompt, images, marker) catch |err| {
             log.err("[llama] media prompt refused: {s}\n", .{@errorName(err)});

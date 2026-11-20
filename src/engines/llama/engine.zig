@@ -149,7 +149,8 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         fn loadBytes(o: *const abi.Open, bytes: *u64) callconv(.c) abi.Verdict {
             const path = abi.items(u8, o.model_dir);
             bytes.* = fileBytes(path);
-            const vision = gguf_files.findVisionSidecar(io, gpa, path);
+            const settings = parseSettings(abi.items(u8, o.settings_json)) catch return .{ .code = .unsupported, .why = abi.span(u8, "InvalidSettings") };
+            const vision = if (settings.vision) gguf_files.findVisionSidecar(io, gpa, path) else null;
             defer if (vision) |p| gpa.free(p);
             if (vision) |p| bytes.* +|= fileBytes(p);
             return .{};
@@ -345,9 +346,9 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 const images = gpa.alloc(B.Image, r.media.len) catch return end(st, &l, .failed, "OutOfMemory");
                 defer gpa.free(images);
                 for (r.media, images) |m, *image| image.* = .{ .at = m.at, .width = m.width, .height = m.height, .pixels = m.data.slice() };
-                r.prompt_tokens = seq.syncImages(prompt, images, st.image_marker, &r.cancelled, r.max_tokens) catch |err| {
+                r.prompt_tokens = seq.syncImages(prompt, images, st.image_marker, &r.cancelled, &r.max_tokens) catch |err| {
                     seq.reset();
-                    if (err == B.Error.MediaRefused) return end(st, &l, .failed, "the image prompt does not fit this model: reduce the image size or max_tokens (a non-causal projector may need a larger --llama-ubatch; the server log names the exact refusal)");
+                    if (err == B.Error.MediaRefused) return end(st, &l, .failed, "the image prompt does not fit this model: reduce the prompt or image size (a non-causal projector may need a larger --llama-ubatch; the server log names the exact refusal)");
                     return end(st, &l, if (r.isCancelled()) .cancelled else .failed, @errorName(err));
                 };
                 break :blk 0;

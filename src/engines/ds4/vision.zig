@@ -123,24 +123,70 @@ pub fn Cache(comptime B: type, comptime a: std.mem.Allocator) type {
 
         /// No fixed-count eviction cap: every stale image row allocation is released after a successful sync.
         fn prune(self: *Self) void {
-            var i: usize = 0;
-            while (i < self.images.capacity()) : (i += 1) {
-                // Hash-map removals do not invalidate other slots; restart iteration after a removal.
-                var it = self.images.iterator();
-                const removed = while (it.next()) |entry| {
-                    const used = for (self.spans) |sp| {
-                        if (std.mem.eql(u8, &sp.embedding.fingerprint, &entry.value_ptr.fingerprint)) break true;
-                    } else false;
-                    if (!used) {
-                        var emb = entry.value_ptr.*;
-                        const key = entry.key_ptr.*;
-                        _ = self.images.remove(key);
-                        B.Ds4Engine.freeEmbedding(&emb);
-                        break true;
-                    }
+            var stale: std.ArrayList(Key) = .empty;
+            defer stale.deinit(a);
+            var it = self.images.iterator();
+            while (it.next()) |entry| {
+                const used = for (self.spans) |sp| {
+                    if (std.mem.eql(u8, &sp.embedding.fingerprint, &entry.value_ptr.fingerprint)) break true;
                 } else false;
-                if (!removed) break;
+                if (!used) stale.append(a, entry.key_ptr.*) catch return;
             }
+            for (stale.items) |key| if (self.images.fetchRemove(key)) |entry| {
+                var emb = entry.value;
+                B.Ds4Engine.freeEmbedding(&emb);
+            };
         }
     };
+}
+
+test "image cache validates marker runs, pixel identity, and stale embedding ownership" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const v: Tokens = .{ .start = 10, .pad = 11, .end = 12, .placeholder = "image" };
+    const B = struct {
+        const Embedding = struct { data: ?[*]f32 = null, token_count: u32 = 0, fingerprint: [32]u8 = @splat(0) };
+        const Span = struct { token_start: u32 = 0, embedding: Embedding = .{} };
+        const Ds4Session = struct {
+            fn syncMultimodal(_: *@This(), _: []const i32, _: []const Span, _: *std.atomic.Value(bool)) !void {}
+        };
+        const Ds4Engine = struct {
+            var rows: [1]f32 = .{0};
+            var freed: usize = 0;
+            fn encodeImage(_: *@This(), encoded: []const u8) !Embedding {
+                var fingerprint: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(encoded, &fingerprint, .{});
+                return .{ .data = &rows, .token_count = 3, .fingerprint = fingerprint };
+            }
+            fn freeEmbedding(_: *Embedding) void {
+                freed += 1;
+            }
+        };
+    };
+    const C = Cache(B, a);
+    var cache: C = .{};
+    defer cache.deinit();
+    var engine: B.Ds4Engine = .{};
+    const black: [12]u8 = @splat(0);
+    const white: [12]u8 = @splat(255);
+    const media = [_]abi.Media{.{ .kind = .image, .at = 0, .width = 2, .height = 2, .data = .of(&black), .hash = 0 }};
+    const replacement = [_]abi.Media{.{ .kind = .image, .at = 0, .width = 2, .height = 2, .data = .of(&white), .hash = 1 }};
+
+    try testing.expectError(error.MediaPlaceholderMismatch, cache.expand(&engine, v, &.{ 1, 2 }, &media));
+    try testing.expectError(error.MediaPlaceholderMismatch, cache.expand(&engine, v, &.{ 10, 11, 12, 10, 11, 12 }, &media));
+    const expanded = try cache.expand(&engine, v, &.{ 1, 10, 11, 12, 2 }, &media);
+    defer a.free(expanded);
+    try testing.expectEqualSlices(i32, &.{ 1, 10, 11, 11, 11, 12, 2 }, expanded);
+    try testing.expectError(error.MediaPlaceholderMismatch, cache.imageSpans(&engine, v, &.{ 10, 11, 11, 12 }, &media));
+
+    var session: B.Ds4Session = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    try cache.sync(&engine, &session, v, expanded, &media, &cancel);
+    try testing.expect(try cache.continues(&engine, &media));
+    try testing.expect(!(try cache.continues(&engine, &replacement)));
+    try testing.expectEqual(@as(usize, 2), cache.images.count());
+
+    try cache.sync(&engine, &session, v, expanded, &replacement, &cancel);
+    try testing.expectEqual(@as(usize, 1), cache.images.count());
+    try testing.expectEqual(@as(usize, 1), B.Ds4Engine.freed);
 }

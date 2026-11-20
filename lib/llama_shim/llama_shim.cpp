@@ -435,7 +435,7 @@ static int32_t mtp_catch_up(mlx_llama_ctx *c, const Row *rows, int32_t n) {
         const int32_t idx = llama_batch_ext_add_token(c->dbatch, rows[i].seq, rows[i].tok);
         if (idx < 0) return -1;
         llama_batch_ext_set_pos(c->dbatch, idx, &rows[i].pos);
-        if (!llama_batch_ext_set_embd_token(c->dbatch, idx, { hrow, 1, w })) return -1;
+        if (!llama_batch_ext_set_embd_state(c->dbatch, idx, { hrow, 1, w })) return -1;
     }
     const int32_t rc = llama_process(c->dft, LLAMA_PROCESS_TYPE_DECODE, c->dbatch);
     if (rc != 0) return rc;
@@ -528,7 +528,7 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
                                               const int32_t *prompt, int32_t n_prompt,
                                               const mlx_llama_image *images, int32_t n_images,
                                               const int32_t *marker, int32_t n_marker,
-                                              uint32_t max_tokens,
+                                              uint32_t *max_tokens,
                                               uint32_t *out_expanded,
                                               bool (*cancelled)(void *), void *cancel_ud,
                                               char *err, size_t errlen) {
@@ -667,11 +667,11 @@ extern "C" int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
     // before the image expansion (and a client may over-ask); the prompt itself fits,
     // so the answer is a shorter budget, never a failed request. Generation stops at
     // the clamp exactly as an explicit max_tokens would.
-    if (expanded + (int64_t)max_tokens > n_ctx_seq) {
+    if (expanded + (int64_t)*max_tokens > n_ctx_seq) {
         const uint32_t clamped = (uint32_t)(n_ctx_seq - expanded);
         fprintf(stderr, "[llama] media budget clamped: max_tokens %u -> %u (prompt %lld, ctx %lld)\n",
-                max_tokens, clamped, (long long)expanded, (long long)n_ctx_seq);
-        max_tokens = clamped;
+                *max_tokens, clamped, (long long)expanded, (long long)n_ctx_seq);
+        *max_tokens = clamped;
     }
 
     // Cold prefill: the sequence starts empty, so no KV of an earlier request
@@ -849,7 +849,7 @@ static int32_t draft(mlx_llama_ctx *c, int32_t seq, llama_token id_last, llama_p
         if (idx < 0) break;
         const llama_pos p = pos0 + n;
         llama_batch_ext_set_pos(c->dbatch, idx, &p);
-        if (!llama_batch_ext_set_embd_token(c->dbatch, idx, { c->draft_h.data(), 1, w })) break;
+        if (!llama_batch_ext_set_embd_state(c->dbatch, idx, { c->draft_h.data(), 1, w })) break;
         llama_batch_ext_set_output_logits(c->dbatch, idx, true);
         if (llama_process(c->dft, LLAMA_PROCESS_TYPE_DECODE, c->dbatch) != 0) break;
         const float *logits = llama_get_logits_ith(c->dft, idx);

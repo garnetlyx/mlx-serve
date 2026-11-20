@@ -111,7 +111,7 @@ const FakeBridge = struct {
             s.lent = true;
             return &s.row;
         }
-        pub fn syncImages(s: *LlamaSeq, p: []const i32, images: []const Image, _: []const i32, cancelled: *const std.atomic.Value(bool), _: u32) !u32 {
+        pub fn syncImages(s: *LlamaSeq, p: []const i32, images: []const Image, _: []const i32, cancelled: *const std.atomic.Value(bool), budget: *u32) !u32 {
             if (cancelled.load(.acquire)) return error.Cancelled;
             s.resident.clearRetainingCapacity();
             try s.resident.appendSlice(testing.allocator, p);
@@ -120,6 +120,7 @@ const FakeBridge = struct {
                 // Different RGB must produce different logits even with identical placeholder ids.
                 try s.resident.appendNTimes(testing.allocator, 50, image.pixels[0] + 2);
             }
+            budget.* = @min(budget.*, 2); // Two decode cells left in this fixture.
             return @intCast(s.resident.items.len);
         }
         pub fn reset(s: *LlamaSeq) void {
@@ -304,6 +305,10 @@ test "llama adapter: a sidecar enables image atoms, distinct pixels miss cache a
     var info: abi.Info = undefined;
     const e = try openFake(path, "{\"seqs\":1,\"mtp_drafts\":3}", &info);
     defer Fake.table.close(e);
+    var disabled_info: abi.Info = undefined;
+    const disabled = try openFake(path, "{\"vision\":false}", &disabled_info);
+    defer Fake.table.close(disabled);
+    try testing.expect(!disabled_info.caps.images);
     try testing.expect(info.caps.images);
     try testing.expectEqualStrings("<__media__>", info.image_placeholder.slice());
     const prompt = [_]u32{ 1, '<', '_', '_', 'm', 'e', 'd', 'i', 'a', '_', '_', '>', 2 };
@@ -321,14 +326,17 @@ test "llama adapter: a sidecar enables image atoms, distinct pixels miss cache a
     blue[0].data = .of(&.{ 0, 0, 3 });
     var next = r;
     next.media = .of(&blue);
+    next.max_tokens = 5;
     var b: Collect = .{};
     defer b.toks.deinit(testing.allocator);
     try testing.expectEqual(abi.Verdict.Code.ok, Fake.table.submit(e, 2, &next, b.sink()).code);
     b.wait();
     try testing.expectEqual(Reason.length, b.reason);
+    try testing.expectEqual(@as(usize, 2), b.toks.items.len);
     try testing.expect(a.toks.items[0] != b.toks.items[0]);
     try testing.expectEqual(@as(u32, 0), b.cached);
 
+    next.max_tokens = 1;
     next.media = .{};
     next.prompt = .of(&.{ 5, 6, 7 });
     var c: Collect = .{};
@@ -427,7 +435,7 @@ fn realMmprojGguf() ?[]const u8 {
     return if (s.len == 0) null else s;
 }
 
-test "llama adapter: the real bridge expands an image and refuses one past the context" {
+test "llama adapter: the real bridge clamps the decode budget after image expansion" {
     if (!build_options.llama_engine) return error.SkipZigTest;
     const path = realMmprojGguf() orelse return error.SkipZigTest;
     const gguf_files = @import("../../sdk/quant/gguf/files.zig");
@@ -461,12 +469,13 @@ test "llama adapter: the real bridge expands an image and refuses one past the c
     for (pixels, 0..) |*px, i| px.* = if (i % 3 == 0) 255 else 0; // solid red
     const images = [_]bridge.Image{.{ .at = at, .width = 64, .height = 64, .pixels = pixels }};
     var cancel = std.atomic.Value(bool).init(false);
-    const expanded = try seq.syncImages(prompt.items, &images, marker, &cancel, 64);
+    var budget: u32 = 64;
+    const expanded = try seq.syncImages(prompt.items, &images, marker, &cancel, &budget);
     try testing.expect(expanded > prompt.items.len); // the image took KV cells
     var rng: u64 = 0;
     try testing.expect(seq.sample(.{ .temperature = 0 }, &rng) >= 0);
 
-    // The same pixels sync again (cold), and a reply past the context is refused by name.
-    _ = try seq.syncImages(prompt.items, &images, marker, &cancel, 64);
-    try testing.expectError(bridge.Error.MediaRefused, seq.syncImages(prompt.items, &images, marker, &cancel, std.math.maxInt(u32)));
+    budget = std.math.maxInt(u32);
+    try testing.expectEqual(expanded, try seq.syncImages(prompt.items, &images, marker, &cancel, &budget));
+    try testing.expectEqual(@as(u32, 4096), expanded + budget);
 }
